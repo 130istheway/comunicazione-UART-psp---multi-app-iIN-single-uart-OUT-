@@ -4,7 +4,6 @@
     REFACTORED: Pure UART relay - plugins handle their own command formatting and parsing
 */
 
-
 #include <pspsdk.h>
 #include <pspkernel.h>
 #include <pspdebug.h>
@@ -14,131 +13,146 @@
 #include <stdio.h>
 
 PSP_MODULE_INFO("UART_Manager", 0x1000, 1, 1); // Kernel Mode
-PSP_MAIN_THREAD_ATTR(0x10); // High Priority Thread
+PSP_MAIN_THREAD_ATTR(0x10); // High Priority
 
-// --- GLOBAL STATE VARIABLES ---
-static SceUID cmd_pipe_out = -1;
-static SceUID ir_cmd_pipe = -1;
-static SceUID app_lock_semaphore = -1;          // General semaphore - prevents multiple apps from running
-
-// --- COMMUNICATION BUFFERS FOR UART ---
-#define UART_RX_BUFFER_SIZE 256
-static unsigned char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+// --- CONFIGURAZIONE E STATO ---
+#define MAX_BUFFER_SIZE 512
+static unsigned char uart_rx_buffer[MAX_BUFFER_SIZE];
 static int uart_rx_index = 0;
 
+static SceUID cmd_pipe_out = -1;
+static SceUID uart_resp_pipe = -1;
+static SceUID app_lock_semaphore = -1;
 
-// --- UART RESPONSE RELAY ---
-// Simply buffer UART data and consume it
-// NOTE: In the future, this could relay responses back to requesting plugin via a response pipe
+typedef struct {
+    int baudrate;
+    int delay_us;
+    int buffer_limit;
+} Config;
+
+Config g_config = {9600, 750, 255}; // Valori di default
+
+// --- FUNZIONE CARICAMENTO CONFIGURAZIONE ---
+void load_config() {
+    SceUID fd = sceIoOpen("ms0:/seplugins/uart_config.ini", PSP_O_RDONLY, 0777);
+    if (fd >= 0) {
+        char file_buf[128];
+        int bytesRead = sceIoRead(fd, file_buf, sizeof(file_buf) - 1);
+        if (bytesRead > 0) {
+            file_buf[bytesRead] = '\0';
+            // Legge: Baudrate, Delay, BufferLimit
+            int b, d, l;
+            if (sscanf(file_buf, "%d %d %d", &b, &d, &l) == 3) {
+                g_config.baudrate = b;
+                g_config.delay_us = d;
+                // Protezione contro overflow: non superare MAX_BUFFER_SIZE - 1
+                if (l < MAX_BUFFER_SIZE) g_config.buffer_limit = l;
+                else g_config.buffer_limit = MAX_BUFFER_SIZE - 1;
+            }
+        }
+        sceIoClose(fd);
+    }
+}
+
+// --- RICEZIONE UART ---
 void process_uart_data(void) {
     int ch = pspDebugSioGetchar();
     
     if (ch != -1) {
         unsigned char c = (unsigned char)ch;
         
-        // Buffer the character
-        if (uart_rx_index < UART_RX_BUFFER_SIZE - 1) {
-            uart_rx_buffer[uart_rx_index++] = c;
-        }
-        
-        // Look for complete response (ends with newline)
+        if (c == '\r') return; // Ignora Carriage Return (standard nei comandi AT)
+
         if (c == '\n') {
+            // Chiudi la stringa nel buffer
             uart_rx_buffer[uart_rx_index] = '\0';
             
-            // TODO: In future, relay response back to the requesting plugin
-            // For now, just consume the data
-            // pspDebugScreenPrintf("UART RX: %s\n", uart_rx_buffer);
+            // Invia la risposta all'App/Plugin tramite la Pipe di ritorno
+            // Usiamo PSP_MSGPIPE_NOWAIT per non bloccare il kernel se l'app non legge
+            if (uart_resp_pipe >= 0 && uart_rx_index > 0) {
+                sceKernelSendMsgPipe(uart_resp_pipe, uart_rx_buffer, uart_rx_index, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+            }
             
-            // Reset buffer for next message
+            // Reset indice per il prossimo messaggio
             uart_rx_index = 0;
-            memset(uart_rx_buffer, 0, UART_RX_BUFFER_SIZE);
+        } 
+        else if (uart_rx_index < g_config.buffer_limit) {
+            // Aggiungi carattere al buffer
+            uart_rx_buffer[uart_rx_index++] = c;
+        } 
+        else {
+            // Emergenza: Buffer saturo senza aver ricevuto \n
+            // Inviamo quello che abbiamo finora per liberare spazio
+            uart_rx_buffer[uart_rx_index] = '\0';
+            if (uart_resp_pipe >= 0) {
+                sceKernelSendMsgPipe(uart_resp_pipe, uart_rx_buffer, uart_rx_index, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+            }
+            uart_rx_index = 0;
         }
     }
 }
 
 
-// --- GENERIC UART COMMAND SENDER ---
-// Send any command to UART (AT commands, IR commands, etc.)
-// Plugins are responsible for formatting their commands correctly
+// --- INVIO UART ---
 void send_uart_command(const char *command) {
     if (command == NULL) return;
-    
     const char *p = command;
     while (*p) {
         pspDebugSioPutchar(*p++);
     }
-    pspDebugSioPutchar('\n'); // Terminate with newline
+    pspDebugSioPutchar('\n');
 }
 
-
-// --- MANAGER THREAD: Pure UART Relay (High Priority: 0x10) ---
+// --- THREAD PRINCIPALE ---
 int uart_manager_thread(SceSize args, void *argp) {
-    // Create general app lock semaphore
-    // Initial value = 1 (available), only ONE app can hold this
+    load_config(); // Carica impostazioni da file .ini
+    
     app_lock_semaphore = sceKernelCreateSema("app_lock", 0, 1, 1, NULL);
-    if (app_lock_semaphore < 0) {
-        pspDebugScreenPrintf("ERROR: Failed to create app lock semaphore\n");
-        return 1;
-    }
     
     pspDebugSioInit();
-    pspDebugSioSetBaud(9600);
+    pspDebugSioSetBaud(g_config.baudrate);
+
+    unsigned char msg_buf[MAX_BUFFER_SIZE];
 
     while(1) {
-        // A. Process incoming UART responses (from devices)
+       
+        // 1. Legge dati in entrata dal dispositivo esterno (UART -> Buffer)
         process_uart_data();
 
-        // B. Process outgoing commands from BT Plugin (Pipe -> UART)
-        unsigned char cmd_msg[256];
-        int recv_size = sceKernelReceiveMsgPipe(cmd_pipe_out, cmd_msg, 256, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+        // 2. Legge comandi in uscita dai plugin (Pipe Unica -> UART)
+        // Non importa se il comando viene dal plugin BT o IR, la pipe è la stessa
+        int recv_size = sceKernelReceiveMsgPipe(cmd_pipe_out, msg_buf, g_config.buffer_limit, PSP_MSGPIPE_NOWAIT, NULL, NULL);
         
         if (recv_size > 0) {
-            // Null-terminate the received string
-            cmd_msg[recv_size] = '\0';
-            
-            // Send command to device via UART (plugin is responsible for command format)
-            send_uart_command((const char*)cmd_msg);
-        }
-
-        // C. Process outgoing commands from IR Plugin (Pipe -> UART)
-        unsigned char ir_msg[256];
-        recv_size = sceKernelReceiveMsgPipe(ir_cmd_pipe, ir_msg, 256, PSP_MSGPIPE_NOWAIT, NULL, NULL);
-        
-        if (recv_size > 0) {
-            // Null-terminate the received string
-            ir_msg[recv_size] = '\0';
-            
-            // Send command to device via UART (plugin is responsible for command format)
-            send_uart_command((const char*)ir_msg);
+            msg_buf[recv_size] = '\0';
+            send_uart_command((const char*)msg_buf);
         }
         
-        sceKernelDelayThread(0); // Yield to other threads
+        // Pausa dinamica
+        sceKernelDelayThread(g_config.delay_us);
     }
-    
-    // Cleanup
-    if (app_lock_semaphore >= 0) {
-        sceKernelDeleteSema(app_lock_semaphore);
-    }
-    
     return 0;
 }
 
-// --- MODULE START ---
+// --- ENTRY POINTS DEL MODULO ---
 int module_start(SceSize args, void *argp) {
-    cmd_pipe_out = sceKernelCreateMsgPipe("SioCmdPipe", 1, 0, 256, NULL);
-    ir_cmd_pipe = sceKernelCreateMsgPipe("IrCmdPipe", 1, 0, 256, NULL);
-    SceUID thid = sceKernelCreateThread("UART_Manager", uart_manager_thread, 0x10, 0x1000, 0, NULL);
-    sceKernelStartThread(thid, 0, NULL);
+    // Pipe per comandi in USCITA (App -> UART)
+    cmd_pipe_out = sceKernelCreateMsgPipe("UartCmdPipe", 1, 0, MAX_BUFFER_SIZE, NULL);
+    
+    // Pipe per risposte in ENTRATA (UART -> App)
+    uart_resp_pipe = sceKernelCreateMsgPipe("UartRespPipe", 1, 0, MAX_BUFFER_SIZE, NULL);
+    
+    SceUID thid = sceKernelCreateThread("UART_Manager", uart_manager_thread, 0x10, 0x2000, 0, NULL);
+    if (thid >= 0) {
+        sceKernelStartThread(thid, 0, NULL);
+    }
     return 0;
 }
 
-// --- MODULE STOP ---
+
 int module_stop(SceSize args, void *argp) {
-    if (cmd_pipe_out >= 0) {
-        sceKernelDeleteMsgPipe(cmd_pipe_out);
-    }
-    if (ir_cmd_pipe >= 0) {
-        sceKernelDeleteMsgPipe(ir_cmd_pipe);
-    }
+    if (cmd_pipe_out >= 0) sceKernelDeleteMsgPipe(cmd_pipe_out);
+    if (uart_resp_pipe >= 0) sceKernelDeleteMsgPipe(uart_resp_pipe);
+    if (app_lock_semaphore >= 0) sceKernelDeleteSema(app_lock_semaphore);
     return 0;
 }

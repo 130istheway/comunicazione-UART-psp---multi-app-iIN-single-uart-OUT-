@@ -38,9 +38,11 @@ typedef struct {
 
 static BT_Module_State bt_state = {0};
 
+
 // --- STATE STRUCTURE ---
 typedef struct {
     SceUID cmd_pipe;
+    SceUID resp_pipe;
     int connected;
     char device_name[32];
     char mac_address[12];
@@ -91,6 +93,14 @@ typedef enum {
     AT_RESP_VM_LINK
 } AT_Response_Type;
 
+// --- AT COMMAND TYPE ---
+static const char* AT_CMD_STATUS       = "AT+STATUS\r";
+static const char* AT_CMD_SCAN         = "AT+SCAN\r";
+static const char* AT_CMD_CONNECT      = "AT+CONNECT\r";
+static const char* AT_CMD_DISCONNECT   = "AT+DISCONNECT\r";
+static const char* AT_CMD_VMLINK_QUERY = "AT+VMLINK?\r";
+static const char* AT_CMD_VMLINK       = "AT+VMLINK\r";
+
 // --- AT RESPONSE TYPE IDENTIFIER ---
 // Identifies which type of response we received
 AT_Response_Type identify_response_type(const char *response) {
@@ -106,11 +116,12 @@ AT_Response_Type identify_response_type(const char *response) {
     if (strstr(response, "CON:0x") != NULL) {
         return AT_RESP_CONNECTION_MAC;
     }
-    if (strstr(response, "CONNECTED") != NULL && strstr(response, "DISCONNECT") == NULL) {
-        return AT_RESP_CONNECTED;
-    }
+    // Check DISCONNECT first since it contains "CONNECT" - more specific pattern first
     if (strstr(response, "DISCONNECT") != NULL) {
         return AT_RESP_DISCONNECTED;
+    }
+    if (strstr(response, "CONNECTED") != NULL) {
+        return AT_RESP_CONNECTED;
     }
     if (strstr(response, "MacAdd:0x") != NULL) {
         return AT_RESP_DEVICE_FOUND;
@@ -122,7 +133,7 @@ AT_Response_Type identify_response_type(const char *response) {
 }
 
 // --- AT COMMAND PARSER (using switch case) ---
-// This plugin now parses responses from AT commands
+// This plugin parses responses from AT commands
 void parse_at_response(const char *response) {
     AT_Response_Type resp_type = identify_response_type(response);
     
@@ -204,9 +215,17 @@ void parse_at_response(const char *response) {
 
 // --- UART RESPONSE PROCESSING (Polling from UART) ---
 void process_uart_responses(void) {
-    // In a real implementation with response pipes, this would receive data back
-    // For now, we assume the UART Manager is handling UART I/O
-    // Plugins can add a separate response pipe if needed for bidirectional communication
+    char response_buffer[256];
+    
+    // Legge dalla pipe in modo non bloccante
+    int bytes_received = sceKernelReceiveMsgPipe(resp_pipe_id, response_buffer, 255, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+
+    if (bytes_received > 0) {
+        response_buffer[bytes_received] = '\0'; // Assicura lo zero terminale
+        
+        // CHIAMATA AL PARSER: analizza il contenuto del comando AT ricevuto
+        parse_at_response(response_buffer);
+    }
 }
 
 // --- SCREEN DRAWING UTILITIES ---
@@ -222,6 +241,27 @@ void init_graphics(void) {
     pspDebugScreenSetTextColor(0xFFFFFFFF); // White text
 }
 
+
+
+// --- UART APP LOCK ---
+// General semaphore: if already acquired by another app, we can't start
+int try_acquire_app_lock(void) {
+    // Try to wait on "app_lock" semaphore (non-blocking, 0 timeout)
+    int result = sceKernelWaitSema_timed("app_lock", 1, 0);
+    
+    if (result == 0) {
+        return 1; // Lock acquired - we can run
+    } else {
+        return 0; // Lock already held by another app
+    }
+}
+
+void release_app_lock(void) {
+    // Release the app lock for other apps to use
+    sceKernelSignalSema_by_name("app_lock", 1);
+}
+
+
 // --- AT COMMAND SENDING ---
 void send_at_command(const char *command) {
     if (state.cmd_pipe < 0) return;
@@ -235,38 +275,38 @@ void send_at_command(const char *command) {
 }
 
 void send_status_query(void) {
-    send_at_command("AT+STATUS");
+    send_at_command(AT_CMD_STATUS);
 }
 
 void send_scan_command(void) {
     device_count = 0;
     memset(device_list, 0, sizeof(device_list));
-    send_at_command("AT+SCAN");
+    send_at_command(AT_CMD_SCAN);
     snprintf(state.status_msg, sizeof(state.status_msg), "Scanning...");
     state.menu_state = 1;
 }
 
 void send_connect_mac(const char *mac) {
     char at_cmd[32];
-    snprintf(at_cmd, sizeof(at_cmd), "AT+CONADD=%s", mac);
+    snprintf(at_cmd, sizeof(at_cmd), AT_CMD_CONNECT "%s", mac);
     send_at_command(at_cmd);
 }
 
 void send_disconnect(void) {
-    send_at_command("AT+DISCON");
+    send_at_command(AT_CMD_DISCONNECT);
 }
 
 void send_vmlink_query(void) {
     vm_count = 0;
     memset(vm_list, 0, sizeof(vm_list));
-    send_at_command("AT+VMLINK?");
+    send_at_command(AT_CMD_VMLINK_QUERY);
     snprintf(state.status_msg, sizeof(state.status_msg), "Querying VM Link...");
     state.menu_state = 2;
 }
 
 void save_to_vmlink(const char *mac) {
     char at_cmd[32];
-    snprintf(at_cmd, sizeof(at_cmd), "AT+ADDLINKADD=%s", mac);
+    snprintf(at_cmd, sizeof(at_cmd), AT_CMD_VMLINK "%s", mac);
     send_at_command(at_cmd);
     snprintf(state.status_msg, sizeof(state.status_msg), "Device saved to auto-connect");
 }
@@ -388,10 +428,36 @@ void render_vmlink_menu(void) {
 int main_thread(SceSize args, void *argp) {
     init_graphics();
     
+    // Try to acquire general app lock (only one app can run at a time)
+    if (!try_acquire_app_lock()) {
+        pspDebugScreenPuts("ERROR: Another app is already running!");
+        pspDebugScreenPuts("(IR Controller or BT Manager)");
+        pspDebugScreenPuts("");
+        pspDebugScreenPuts("Exit the other app first.");
+        pspDebugScreenPuts("");
+        pspDebugScreenPuts("Press HOME to exit.");
+        while (1) {
+            SceCtrlData pad;
+            sceCtrlReadBufferPositive(&pad, 1);
+            if (pad.Buttons & PSP_CTRL_HOME) {
+                sceKernelExitGame();
+            }
+            sceKernelDelayThread(100000);
+        }
+        return -1;
+    }
+    
     // Open message pipe to UART Manager
     state.cmd_pipe = sceKernelCreateMsgPipe("SioCmdPipe", 1, 0, 256, NULL);
     if (state.cmd_pipe < 0) {
         pspDebugScreenPuts("ERROR: Cannot open UART Manager pipe!");
+        sceKernelSleepThread();
+        return -1;
+    }
+
+    state.resp_pipe = sceKernelCreateMsgPipe("UartRespPipe", 1, 0, 256, NULL);
+    if (state.resp_pipe < 0) {
+        pspDebugScreenPuts("ERROR: Cannot open UART Response pipe!");
         sceKernelSleepThread();
         return -1;
     }
@@ -431,9 +497,9 @@ int main_thread(SceSize args, void *argp) {
 }
 
 // --- MODULE START/STOP ---
+{
 int module_start(SceSize args, void *argp) {
-    SceUID thid = sceKernelCreateThread("BTManager", main_thread, 0x20, 
-                                         0x10000, 0, NULL);
+    SceUID thid = sceKernelCreateThread("BTManager", main_thread, 0x20, 0x10000, 0, NULL);
     if (thid >= 0) {
         sceKernelStartThread(thid, args, argp);
     }
@@ -446,3 +512,5 @@ int module_stop(SceSize args, void *argp) {
     }
     return 0;
 }
+}
+

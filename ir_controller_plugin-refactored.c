@@ -94,6 +94,7 @@ static ESP32_IR_State ir_state = {0};
 // --- STATE STRUCTURE ---
 typedef struct {
     SceUID ir_pipe;
+    SceUID resp_pipe;
     
     unsigned char ir_mode;      // 0=TX, 1=RX
     int current_protocol_idx;   // Index in protocol list
@@ -160,7 +161,7 @@ static int ir_response_index = 0;
 
 // --- IR RESPONSE PARSER ---
 // This plugin now parses responses from IR commands
-void parse_ir_response(const char *response) {
+void parse_at_response(const char *response) {
     if (strstr(response, "IR:TX:") != NULL) {
         // IR transmission acknowledgment
         // Format: IR:TX:0x1A2B3C4D (code transmitted)
@@ -187,8 +188,7 @@ void parse_ir_response(const char *response) {
         // Format: IR:MODE:TX or IR:MODE:RX
         unsigned char mode = (strstr(response, "TX") != NULL) ? 0 : 1;
         ir_state.ir_mode = mode;
-        snprintf(state.status_msg, sizeof(state.status_msg), "IR Mode: %s", 
-                 mode ? "RX (Receiver)" : "TX (Transmitter)");
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR Mode: %s", mode ? "RX (Receiver)" : "TX (Transmitter)");
         return;
     }
     
@@ -202,6 +202,21 @@ void parse_ir_response(const char *response) {
         // IR command error
         snprintf(state.status_msg, sizeof(state.status_msg), "IR: ERROR");
         return;
+    }
+}
+
+// --- UART RESPONSE PROCESSING (Polling from UART) --- in case i want to read the responses
+void process_uart_responses(void) {
+    char response_buffer[256];
+    
+    // Legge dalla pipe in modo non bloccante
+    int bytes_received = sceKernelReceiveMsgPipe(resp_pipe_id, response_buffer, 255, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+
+    if (bytes_received > 0) {
+        response_buffer[bytes_received] = '\0'; // Assicura lo zero terminale
+        
+        // CHIAMATA AL PARSER: analizza il contenuto del comando AT ricevuto
+        parse_at_response(response_buffer);
     }
 }
 
@@ -258,7 +273,7 @@ void send_ir_command(const char *command) {
 void transmit_ir_code(unsigned int code) {
     // Send IR transmission command - plugin is responsible for command format
     char ir_cmd[64];
-    snprintf(ir_cmd, sizeof(ir_cmd), "AT+IRTX=%08X", code);
+    snprintf(ir_cmd, sizeof(ir_cmd), "IR+TX=%08X", code);
     send_ir_command(ir_cmd);
     state.current_code = code;
     
@@ -460,8 +475,7 @@ void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const 
         protocols[protocol_idx].codes = new_codes;
         
         // Expand names array
-        char **new_names = (char **)realloc(protocols[protocol_idx].code_names, 
-                                           new_capacity * sizeof(char *));
+        char **new_names = (char **)realloc(protocols[protocol_idx].code_names, new_capacity * sizeof(char *));
         if (new_names == NULL) {
             snprintf(state.status_msg, sizeof(state.status_msg), "Memory allocation failed!");
             return;
@@ -549,12 +563,12 @@ void set_ir_mode_rx(void) {
 
 void send_protocol_parameters(int protocol_idx) {
     // Send protocol parameters to ESP32
-    // Command: AT+IRPROTO=<name>,<carrier_freq>,<bits>
+    // Command: IR+PROTO=<name>,<carrier_freq>,<bits>
     if (protocol_idx >= 0 && protocol_idx < protocol_count) {
         IR_Protocol *proto = &protocols[protocol_idx];
         
         char cmd[96];
-        snprintf(cmd, sizeof(cmd), "AT+IRPROTO=%s,%d,%d", 
+        snprintf(cmd, sizeof(cmd), "IR+PROTO=%s,%d,%d", 
                  proto->name, proto->carrier_freq, proto->bits);
         
         send_ir_command(cmd);
@@ -716,10 +730,15 @@ void handle_input(SceCtrlData *pad) {
             sceKernelDelayThread(200000);
         }
         
-        if (pad->Buttons & PSP_CTRL_CROSS && current_code_count > 0) {
+        if (pad->Buttons & PSP_CTRL_CROSS && current_code_count > 0 && state.ir_mode == IR_MODE_TX) {
             // Transmit code from current protocol
             unsigned int code = protocols[state.current_protocol_idx].codes[page_start + state.selected_preset];
             transmit_ir_code(code);
+            sceKernelDelayThread(300000);
+        }
+
+        if (pad->Buttons & PSP_CTRL_CROSS && state.ir_mode == IR_MODE_RX) {
+            set_ir_mode_tx();
             sceKernelDelayThread(300000);
         }
     }
@@ -738,17 +757,22 @@ void handle_input(SceCtrlData *pad) {
             }
             
             if (pad->Buttons & PSP_CTRL_SQUARE) {
-                // Exit receive mode (back to TX)
-                set_ir_mode_tx();
+                // need to resend the current code that is viewed
+                unsigned int code = protocols[state.current_protocol_idx].codes[page_start + state.selected_preset];
+                transmit_ir_code(code);
                 sceKernelDelayThread(300000);
             }
-            
-            if (pad->Buttons & PSP_CTRL_LTRIGGER && state.ir_mode == IR_MODE_RX && state.current_code != 0) {
-                // Activate keyboard to name the code
+
+            if (pad->Buttons & PSP_CTRL_CIRCLE && state.ir_mode == IR_MODE_RX && state.current_code != 0) {
+                // Save last received code to current protocol
                 state.keyboard_active = 1;
                 memset(state.keyboard_input, 0, sizeof(state.keyboard_input));
                 state.keyboard_cursor_x = 0;
                 state.keyboard_cursor_y = 0;
+
+                if (state.current_code != 0) {
+                    save_code_to_protocol(state.current_code, state.current_protocol_idx);
+                }
                 sceKernelDelayThread(300000);
             }
         }
@@ -775,9 +799,13 @@ void handle_input(SceCtrlData *pad) {
     if (state.menu_state == 3) {
         // History view
         if (pad->Buttons & PSP_CTRL_UP || pad->Buttons & PSP_CTRL_DOWN) {
-            // Scroll through history (can be enhanced)
+            // Scroll through history (can be enhanced) not implemented
             sceKernelDelayThread(150000);
         }
+
+        if (pad->Buttons & PSP_CTRL_START) {
+            state.menu_state = 0; // Back to main menu
+            sceKernelDelayThread(300000);
     }
 }
 
@@ -786,76 +814,74 @@ void render_main_menu(void) {
     pspDebugScreenClear();
     
     debug_print(10, 10, "ESP32 IR Controller v1.2", 0xFFFFFF00);
-    
-    // Mode indicator
-    const char *mode_str = (state.ir_mode == IR_MODE_TX) ? "TX (Transmitter)" : "RX (Receiver)";
-    unsigned int mode_color = (state.ir_mode == IR_MODE_TX) ? 0xFF00FF00 : 0xFFFF6600;
-    debug_print(10, 25, mode_str, mode_color);
-    
-    // Protocol indicator
-    char protocol_str[64];
-    snprintf(protocol_str, sizeof(protocol_str), "Protocol: %s", get_protocol_name(state.current_protocol_idx));
-    debug_print(200, 25, protocol_str, 0xFF00FFFF);
-    
-    // Status message
-    debug_print(10, 40, state.status_msg, 0xFFFFFFFF);
-    
     debug_print(10, 60, "================================", 0xFF666666);
-    
-    // Current code display
-    if (state.current_code != 0) {
-        char code_str[64];
-        snprintf(code_str, sizeof(code_str), "Last Code: 0x%08X", state.current_code);
-        debug_print(10, 75, code_str, 0xFF00FF00);
-    }
-    
-    // Display codes from current protocol with pagination
-    int current_code_count = protocols[state.current_protocol_idx].code_count;
-    int codes_per_page = 10;
-    int total_pages = (current_code_count > 0) ? (current_code_count + codes_per_page - 1) / codes_per_page : 1;
-    int page_start = state.current_page * codes_per_page;
-    int page_end = (state.current_page + 1) * codes_per_page;
-    if (page_end > current_code_count) page_end = current_code_count;
-    
-    if (current_code_count > 0) {
-        debug_print(10, 90, "Available IR Codes:", 0xFF00FFFF);
-        
-        char page_info[64];
-        snprintf(page_info, sizeof(page_info), "[Page %d/%d] (%d codes total)", 
-                 state.current_page + 1, total_pages, current_code_count);
-        debug_print(350, 90, page_info, 0xFFFFCC00);
-        
-        for (int i = page_start; i < page_end && i < current_code_count; i++) {
-            char line[96];
-            char prefix[4] = "  ";
+
+    if (state.ir_mode == IR_MODE_RX) {
+        debug_print(10, 50, "Status: RECEIVE MODE", 0xFFCCCCCC);
+        debug_print(10, 70, "Press X to enter transmit mode", 0xFFFFFFFF);
             
-            if ((i - page_start) == state.selected_preset) {
-                strcpy(prefix, "> ");
-            }
-            
-            unsigned int code = protocols[state.current_protocol_idx].codes[i];
-            char *code_name = protocols[state.current_protocol_idx].code_names[i];
-            
-            if (code_name && strlen(code_name) > 0) {
-                snprintf(line, sizeof(line), "%s[%d] %s (0x%08X)", prefix, i + 1, code_name, code);
-            } else {
-                snprintf(line, sizeof(line), "%s[%d] 0x%08X", prefix, i + 1, code);
-            }
-            
-            unsigned int color = ((i - page_start) == state.selected_preset) ? 0xFF00FF00 : 0xFFCCCCCC;
-            debug_print(10, 105 + ((i - page_start) * 12), line, color);
-        }
+        debug_print(10, 235, "X: Enter TC Mode  |  L/R: Menu", 0xFF888888);
+
     } else {
-        debug_print(10, 90, "No codes in current protocol!", 0xFFFF0000);
-        debug_print(10, 105, "Add codes via Receive Mode", 0xFFCCCCCC);
+
+        // Current code display
+        if (state.current_code != 0) {
+            char code_str[64];
+            snprintf(code_str, sizeof(code_str), "Last Code: 0x%08X", state.current_code);
+            debug_print(10, 75, code_str, 0xFF00FF00);
+        }
+        
+        // Display codes from current protocol with pagination
+        int current_code_count = protocols[state.current_protocol_idx].code_count;
+        int codes_per_page = 10;
+        int total_pages = (current_code_count > 0) ? (current_code_count + codes_per_page - 1) / codes_per_page : 1;
+        int page_start = state.current_page * codes_per_page;
+        int page_end = (state.current_page + 1) * codes_per_page;
+        if (page_end > current_code_count) page_end = current_code_count;
+        
+        if (current_code_count > 0) {
+            debug_print(10, 90, "Available IR Codes:", 0xFF00FFFF);
+            
+            char page_info[64];
+            snprintf(page_info, sizeof(page_info), "[Page %d/%d] (%d codes total)", 
+                    state.current_page + 1, total_pages, current_code_count);
+            debug_print(350, 90, page_info, 0xFFFFCC00);
+            
+            for (int i = page_start; i < page_end && i < current_code_count; i++) {
+                char line[96];
+                char prefix[4] = "  ";
+                
+                if ((i - page_start) == state.selected_preset) {
+                    strcpy(prefix, "> ");
+                }
+                
+                unsigned int code = protocols[state.current_protocol_idx].codes[i];
+                char *code_name = protocols[state.current_protocol_idx].code_names[i];
+                
+                if (code_name && strlen(code_name) > 0) {
+                    snprintf(line, sizeof(line), "%s[%d] %s (0x%08X)", prefix, i + 1, code_name, code);
+                } else {
+                    snprintf(line, sizeof(line), "%s[%d] 0x%08X", prefix, i + 1, code);
+                }
+                
+                unsigned int color = ((i - page_start) == state.selected_preset) ? 0xFF00FF00 : 0xFFCCCCCC;
+                debug_print(10, 105 + ((i - page_start) * 12), line, color);
+            }
+        } else {
+            debug_print(10, 90, "No codes in current protocol!", 0xFFFF0000);
+            debug_print(10, 105, "Add codes via Receive Mode", 0xFFCCCCCC);
+        }
+        
+        // Controls help
+        debug_print(10, 215, "UP/DOWN: Select Code  |  X: Transmit", 0xFF888888);
+        debug_print(10, 230, "LEFT/RIGHT: Page  |  L/R: Menu  |  HOME: Exit", 0xFF888888);
     }
-    
-    // Controls help
-    debug_print(10, 215, "UP/DOWN: Select Code  |  X: Transmit", 0xFF888888);
-    debug_print(10, 230, "LEFT/RIGHT: Page  |  L/R: Menu  |  HOME: Exit", 0xFF888888);
 }
 
+// --- RECEIVE MENU --- still bugged
 void render_receive_menu(void) {
+    process_uart_responses();
+
     if (state.keyboard_active) {
         // Show keyboard overlay
         render_keyboard();
@@ -870,6 +896,7 @@ void render_receive_menu(void) {
             debug_print(10, 50, "Status: RECEIVING...", 0xFF00FF00);
             debug_print(10, 65, "Waiting for IR codes...", 0xFFFFFFFF);
             
+            if ()
             char proto_str[80];
             snprintf(proto_str, sizeof(proto_str), "Saving to: %s", get_protocol_name(state.current_protocol_idx));
             debug_print(10, 85, proto_str, 0xFF00FFFF);
@@ -879,7 +906,7 @@ void render_receive_menu(void) {
                 snprintf(code_str, sizeof(code_str), "Last Code: 0x%08X", state.current_code);
                 debug_print(10, 105, code_str, 0xFF00FFFF);
                 
-                debug_print(10, 225, "L: Name & Save  |  SQUARE: Exit RX  |  L/R: Change Menu", 0xFF888888);
+                debug_print(10, 225, "L: Name & Save  |  SQUARE: Send code to test  |  L/R: Change Menu", 0xFF888888);
             } else {
                 debug_print(10, 225, "Waiting for IR signal...  |  SQUARE: Exit RX  |  L/R: Menu", 0xFF888888);
             }
@@ -942,7 +969,7 @@ void render_history_menu(void) {
         debug_print(10, 50, "No history yet", 0xFFCCCCCC);
     }
     
-    debug_print(10, 235, "START: Back to Main Menu", 0xFF888888);
+    debug_print(10, 235, "START: Back to Main Menu |  L/R: Menu", 0xFF888888);
 }
 
 // --- MAIN THREAD ---
@@ -968,20 +995,25 @@ int main_thread(SceSize args, void *argp) {
         return -1;
     }
     
+
     // Open message pipe to UART Manager
-    state.ir_pipe = sceKernelCreateMsgPipe("IrCmdPipe", 1, 0, 256, NULL);
-    if (state.ir_pipe < 0) {
-        pspDebugScreenPuts("ERROR: Cannot open IR Manager pipe!");
+    state.cmd_pipe = sceKernelCreateMsgPipe("SioCmdPipe", 1, 0, 256, NULL);
+    if (state.cmd_pipe < 0) {
+        pspDebugScreenPuts("ERROR: Cannot open UART Manager pipe!");
+        release_app_lock();
+        sceKernelSleepThread();
+        return -1;
+    }
+
+    state.resp_pipe = sceKernelCreateMsgPipe("UartRespPipe", 1, 0, 256, NULL);
+    if (state.resp_pipe < 0) {
+        pspDebugScreenPuts("ERROR: Cannot open UART Response pipe!");
         release_app_lock();
         sceKernelSleepThread();
         return -1;
     }
     
-    // Initialize data directory and scan for protocols
-    create_data_directory();
-    scan_protocols();
-    load_default_protocol();
-    
+
     if (protocol_count == 0) {
         strncpy(state.status_msg, "No protocols found!", sizeof(state.status_msg) - 1);
     } else {
@@ -1026,8 +1058,7 @@ int main_thread(SceSize args, void *argp) {
 
 // --- MODULE START/STOP ---
 int module_start(SceSize args, void *argp) {
-    SceUID thid = sceKernelCreateThread("IRController", main_thread, 0x20, 
-                                         0x10000, 0, NULL);
+    SceUID thid = sceKernelCreateThread("IRController", main_thread, 0x20, 0x10000, 0, NULL);
     if (thid >= 0) {
         sceKernelStartThread(thid, args, argp);
     }
