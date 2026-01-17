@@ -1,18 +1,12 @@
 /*
 ==========================================================
-KCX BT EMITTER MANAGER PLUGIN v1.11
-C Implementation for PSP Kernel Module
+KCX BT EMITTER MANAGER PLUGIN v1.2
+C Implementation for PSP User Module
 ==========================================================
 
-This plugin communicates with the UART Manager kernel module
-to control the KCX BT EMITTER 5 Bluetooth module via AT commands.
-
-Features:
-- Scan for available Bluetooth devices
-- Connect to specific MAC addresses
-- Query auto-connect memory (VM Link)
-- Manage device connections
-- Display connection status
+REFACTORED: Handles its own AT command formatting and response parsing.
+The UART Manager is now a pure relay - this plugin constructs AT commands
+and parses responses independently.
 */
 
 #include <pspsdk.h>
@@ -33,6 +27,16 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define SCREEN_WIDTH    480
 #define SCREEN_HEIGHT   272
 #define LINE_HEIGHT     12
+
+// --- BT STATE STRUCTURE ---
+typedef struct {
+    unsigned char bt_connected;        // 0=no connection, 1=connected
+    unsigned char mac_address[12];     // Hex string MAC address
+    unsigned char device_name[32];     // Device name
+    unsigned char software_version[16]; // Software version
+} BT_Module_State;
+
+static BT_Module_State bt_state = {0};
 
 // --- STATE STRUCTURE ---
 typedef struct {
@@ -68,6 +72,142 @@ typedef struct {
 
 static VM_Link_Entry vm_list[10] = {0};
 static int vm_count = 0;
+
+// --- RESPONSE BUFFER FOR PARSING UART RESPONSES ---
+#define AT_RESPONSE_BUFFER_SIZE 256
+static char at_response_buffer[AT_RESPONSE_BUFFER_SIZE];
+static int at_response_index = 0;
+
+// --- AT RESPONSE TYPES ENUM ---
+typedef enum {
+    AT_RESP_UNKNOWN = 0,
+    AT_RESP_OK,
+    AT_RESP_STATUS,
+    AT_RESP_VERSION,
+    AT_RESP_CONNECTION_MAC,
+    AT_RESP_CONNECTED,
+    AT_RESP_DISCONNECTED,
+    AT_RESP_DEVICE_FOUND,
+    AT_RESP_VM_LINK
+} AT_Response_Type;
+
+// --- AT RESPONSE TYPE IDENTIFIER ---
+// Identifies which type of response we received
+AT_Response_Type identify_response_type(const char *response) {
+    if (strstr(response, "OK+") != NULL) {
+        return AT_RESP_OK;
+    }
+    if (strstr(response, "STATUS:") != NULL) {
+        return AT_RESP_STATUS;
+    }
+    if (strstr(response, "KCX_BTEMITTER") != NULL) {
+        return AT_RESP_VERSION;
+    }
+    if (strstr(response, "CON:0x") != NULL) {
+        return AT_RESP_CONNECTION_MAC;
+    }
+    if (strstr(response, "CONNECTED") != NULL && strstr(response, "DISCONNECT") == NULL) {
+        return AT_RESP_CONNECTED;
+    }
+    if (strstr(response, "DISCONNECT") != NULL) {
+        return AT_RESP_DISCONNECTED;
+    }
+    if (strstr(response, "MacAdd:0x") != NULL) {
+        return AT_RESP_DEVICE_FOUND;
+    }
+    if (strstr(response, "VM_MacAdd") != NULL) {
+        return AT_RESP_VM_LINK;
+    }
+    return AT_RESP_UNKNOWN;
+}
+
+// --- AT COMMAND PARSER (using switch case) ---
+// This plugin now parses responses from AT commands
+void parse_at_response(const char *response) {
+    AT_Response_Type resp_type = identify_response_type(response);
+    
+    switch (resp_type) {
+        case AT_RESP_OK:
+            // Generic OK response - no action needed
+            break;
+        
+        case AT_RESP_STATUS: {
+            // AT+STATUS response - parse connection status
+            // Format: STATUS:x (x=0: no connection, x=1: connected)
+            unsigned char status_val = response[strlen(response) - 1] - '0';
+            bt_state.bt_connected = status_val;
+            snprintf(state.status_msg, sizeof(state.status_msg), "BT Status: %s", 
+                     status_val ? "CONNECTED" : "DISCONNECTED");
+            break;
+        }
+        
+        case AT_RESP_VERSION: {
+            // AT+GMR? response - software version
+            // Format: KCX_BTEMITTER_Vx.x
+            strncpy((char*)bt_state.software_version, response, 15);
+            bt_state.software_version[15] = '\0';
+            snprintf(state.status_msg, sizeof(state.status_msg), "BT Version: %s", bt_state.software_version);
+            break;
+        }
+        
+        case AT_RESP_CONNECTION_MAC: {
+            // AT+CONADD response - MAC address connection
+            // Format: CON:0xf44efdecd39d
+            char *mac_start = strstr(response, "0x");
+            if (mac_start) {
+                strncpy((char*)bt_state.mac_address, mac_start + 2, 12);
+                bt_state.mac_address[12] = '\0';
+                snprintf(state.status_msg, sizeof(state.status_msg), "Connected to MAC: %s", bt_state.mac_address);
+            }
+            break;
+        }
+        
+        case AT_RESP_CONNECTED:
+            // Connection established
+            bt_state.bt_connected = 1;
+            snprintf(state.status_msg, sizeof(state.status_msg), "BT: Device Connected");
+            break;
+        
+        case AT_RESP_DISCONNECTED:
+            // Connection lost
+            bt_state.bt_connected = 0;
+            snprintf(state.status_msg, sizeof(state.status_msg), "BT: Device Disconnected");
+            break;
+        
+        case AT_RESP_DEVICE_FOUND: {
+            // AT+PAIR response - device discovery
+            // Format: MacAdd:0xf44efdecd39d
+            char *mac_start = strstr(response, "0x");
+            if (mac_start && device_count < 16) {
+                snprintf(device_list[device_count].mac, sizeof(device_list[device_count].mac), "%s", mac_start + 2);
+                snprintf(device_list[device_count].name, sizeof(device_list[device_count].name), "Device %d", device_count + 1);
+                device_count++;
+            }
+            break;
+        }
+        
+        case AT_RESP_VM_LINK: {
+            // AT+VMLINK? response - auto-connect memory
+            // Format: VM_MacAdd0=0xf44efdecd39d
+            if (vm_count < 10) {
+                strncpy(vm_list[vm_count].info, response, sizeof(vm_list[vm_count].info) - 1);
+                vm_count++;
+            }
+            break;
+        }
+        
+        default:
+            // Unknown response - ignore
+            break;
+    }
+}
+
+// --- UART RESPONSE PROCESSING (Polling from UART) ---
+void process_uart_responses(void) {
+    // In a real implementation with response pipes, this would receive data back
+    // For now, we assume the UART Manager is handling UART I/O
+    // Plugins can add a separate response pipe if needed for bidirectional communication
+}
 
 // --- SCREEN DRAWING UTILITIES ---
 void debug_print(int x, int y, const char *text, unsigned int color) {
@@ -185,7 +325,7 @@ void handle_input(SceCtrlData *pad) {
 void render_main_menu(void) {
     pspDebugScreenClear();
     
-    debug_print(10, 10, "KCX BT Manager v1.11", 0xFFFFFF00);
+    debug_print(10, 10, "KCX BT Manager v1.2", 0xFFFFFF00);
     
     // Status line
     if (state.connected) {
@@ -270,6 +410,9 @@ int main_thread(SceSize args, void *argp) {
         // Read controller input
         sceCtrlReadBufferPositive(&pad, 1);
         handle_input(&pad);
+        
+        // Process any pending UART responses
+        process_uart_responses();
         
         // Render appropriate menu
         if (state.menu_state == 2) {

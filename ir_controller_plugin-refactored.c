@@ -1,12 +1,12 @@
-
 /*
 ==========================================================
-ESP32 IR CONTROLLER PLUGIN v1.1
-C Implementation for PSP Kernel Module
+ESP32 IR CONTROLLER PLUGIN v1.2
+C Implementation for PSP User Module
 ==========================================================
 
-This plugin communicates with the UART Manager kernel module
-to control the ESP32 Infrared Transmitter/Receiver module.
+REFACTORED: Handles its own IR command formatting and response parsing.
+The UART Manager is now a pure relay - this plugin constructs IR commands
+and parses responses independently.
 
 Features:
 - Transmit IR codes (NEC, RC5, RC6 protocols)
@@ -43,8 +43,16 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define IR_CODE_FILENAME "codes.txt"
 #define IR_CONFIG_FILE "ms0:/game/ircontroller/config.txt"
 
+// --- IR MODE DEFINITIONS ---
+#define IR_MODE_TX 0
+#define IR_MODE_RX 1
+
 // --- IR PROTOCOL DEFINITIONS ---
 #define MAX_PROTOCOLS 16
+#define IR_PROTOCOL_NEC 0
+#define IR_PROTOCOL_RC5 1
+#define IR_PROTOCOL_RC6 2
+#define IR_PROTOCOL_SONY 3
 
 // --- IR PROTOCOL PARAMETERS ---
 typedef struct {
@@ -71,6 +79,17 @@ typedef struct {
     uint16_t carrier_freq;              // Carrier frequency for this protocol
     uint8_t bits;                       // Number of bits for this protocol
 } IR_Protocol;
+
+// --- ESP32 IR STATE STRUCTURE ---
+typedef struct {
+    unsigned char ir_enabled;          // 1=enabled, 0=disabled
+    unsigned char ir_mode;             // 0=TX (transmitter), 1=RX (receiver)
+    unsigned int last_ir_code;         // Last transmitted/received IR code
+    unsigned char ir_protocol;         // Current protocol index
+    unsigned int ir_frequency;         // Carrier frequency in Hz
+} ESP32_IR_State;
+
+static ESP32_IR_State ir_state = {0};
 
 // --- STATE STRUCTURE ---
 typedef struct {
@@ -134,6 +153,58 @@ static IR_History_Entry history[HISTORY_SIZE] = {0};
 static int history_count = 0;
 static int history_index = 0;
 
+// --- IR RESPONSE BUFFER ---
+#define IR_RESPONSE_BUFFER_SIZE 128
+static char ir_response_buffer[IR_RESPONSE_BUFFER_SIZE];
+static int ir_response_index = 0;
+
+// --- IR RESPONSE PARSER ---
+// This plugin now parses responses from IR commands
+void parse_ir_response(const char *response) {
+    if (strstr(response, "IR:TX:") != NULL) {
+        // IR transmission acknowledgment
+        // Format: IR:TX:0x1A2B3C4D (code transmitted)
+        unsigned int code = 0;
+        sscanf(response, "IR:TX:0x%x", &code);
+        ir_state.last_ir_code = code;
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR TX: 0x%08X", code);
+        return;
+    }
+    
+    if (strstr(response, "IR:RX:") != NULL) {
+        // IR code received (when in RX mode)
+        // Format: IR:RX:0x1A2B3C4D
+        unsigned int code = 0;
+        sscanf(response, "IR:RX:0x%x", &code);
+        state.current_code = code;
+        ir_state.last_ir_code = code;
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR RX: 0x%08X", code);
+        return;
+    }
+    
+    if (strstr(response, "IR:MODE:") != NULL) {
+        // IR mode change response
+        // Format: IR:MODE:TX or IR:MODE:RX
+        unsigned char mode = (strstr(response, "TX") != NULL) ? 0 : 1;
+        ir_state.ir_mode = mode;
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR Mode: %s", 
+                 mode ? "RX (Receiver)" : "TX (Transmitter)");
+        return;
+    }
+    
+    if (strstr(response, "IR:OK") != NULL) {
+        // Generic IR command OK
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR: OK");
+        return;
+    }
+    
+    if (strstr(response, "IR:ERR") != NULL) {
+        // IR command error
+        snprintf(state.status_msg, sizeof(state.status_msg), "IR: ERROR");
+        return;
+    }
+}
+
 // --- SCREEN DRAWING UTILITIES ---
 void debug_print(int x, int y, const char *text, unsigned int color) {
     pspDebugScreenSetXY(x / 6, y / LINE_HEIGHT);
@@ -185,7 +256,7 @@ void send_ir_command(const char *command) {
 }
 
 void transmit_ir_code(unsigned int code) {
-    // Send only the code; ESP32 will use the current protocol parameters
+    // Send IR transmission command - plugin is responsible for command format
     char ir_cmd[64];
     snprintf(ir_cmd, sizeof(ir_cmd), "AT+IRTX=%08X", code);
     send_ir_command(ir_cmd);
@@ -249,6 +320,15 @@ void scan_protocols(void) {
         sceIoDclose(dir);
     }
 }
+
+void load_protocol_codes(int protocol_idx);  // Forward declaration
+
+void save_code_to_protocol(unsigned int code, int protocol_idx) {
+    // Save code with default name
+    save_code_to_protocol_with_name(code, protocol_idx, "");
+}
+
+void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const char *code_name);  // Forward declaration
 
 void load_protocol_codes(int protocol_idx) {
     if (protocol_idx < 0 || protocol_idx >= protocol_count) return;
@@ -360,11 +440,6 @@ void load_protocol_codes(int protocol_idx) {
         }
         sceIoClose(fd);
     }
-}
-
-void save_code_to_protocol(unsigned int code, int protocol_idx) {
-    // Save code with default name
-    save_code_to_protocol_with_name(code, protocol_idx, "");
 }
 
 void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const char *code_name) {
@@ -495,36 +570,6 @@ void set_ir_protocol(int protocol_idx) {
         send_protocol_parameters(protocol_idx);
         
         snprintf(state.status_msg, sizeof(state.status_msg), "Protocol: %s", protocols[protocol_idx].name);
-    }
-}
-
-// --- CODE INPUT HELPER ---
-void process_code_input(SceCtrlData *pad, unsigned int *input_buffer, int *digit_count) {
-    // Use numeric buttons to input hex code
-    // Triangle=1, Circle=2, X=3, Square=4, etc.
-    
-    if (*digit_count < 8) {
-        if (pad->Buttons & PSP_CTRL_TRIANGLE) {
-            *input_buffer = (*input_buffer << 4) | 0x1;
-            (*digit_count)++;
-        }
-        if (pad->Buttons & PSP_CTRL_CIRCLE) {
-            *input_buffer = (*input_buffer << 4) | 0x2;
-            (*digit_count)++;
-        }
-        if (pad->Buttons & PSP_CTRL_CROSS) {
-            *input_buffer = (*input_buffer << 4) | 0x3;
-            (*digit_count)++;
-        }
-        if (pad->Buttons & PSP_CTRL_SQUARE) {
-            *input_buffer = (*input_buffer << 4) | 0x4;
-            (*digit_count)++;
-        }
-    }
-    
-    if (pad->Buttons & PSP_CTRL_SELECT && *digit_count > 0) {
-        (*digit_count)--;
-        *input_buffer >>= 4;
     }
 }
 
@@ -740,7 +785,7 @@ void handle_input(SceCtrlData *pad) {
 void render_main_menu(void) {
     pspDebugScreenClear();
     
-    debug_print(10, 10, "ESP32 IR Controller v1.1", 0xFFFFFF00);
+    debug_print(10, 10, "ESP32 IR Controller v1.2", 0xFFFFFF00);
     
     // Mode indicator
     const char *mode_str = (state.ir_mode == IR_MODE_TX) ? "TX (Transmitter)" : "RX (Receiver)";
