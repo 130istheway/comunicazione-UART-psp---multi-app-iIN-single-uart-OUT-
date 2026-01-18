@@ -40,35 +40,25 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 
 // --- FILE PATHS ---
 #define IR_DATA_DIR "ms0:/game/ircontroller/"
-#define IR_CODE_FILENAME "codes.txt"
 #define IR_CONFIG_FILE "ms0:/game/ircontroller/config.txt"
 
 // --- IR MODE DEFINITIONS ---
 #define IR_MODE_TX 0
 #define IR_MODE_RX 1
 
-// --- IR PROTOCOL DEFINITIONS ---
-#define MAX_PROTOCOLS 16
-#define IR_PROTOCOL_NEC 0
-#define IR_PROTOCOL_RC5 1
-#define IR_PROTOCOL_RC6 2
-#define IR_PROTOCOL_SONY 3
+// --- IR CONFIGURATION DEFINITIONS ---
+unsigned int MAX_PROTOCOLS = 16;
+unsigned int HISTORY_SIZE = 20;
+unsigned int IR_RESPONSE_BUFFER_SIZE = 128;
+unsigned int KEYBOARD_COLS = 10;
+unsigend int CODES_PER_PAGE = 10;
 
-// --- IR PROTOCOL PARAMETERS ---
-typedef struct {
-    char name[32];
-    uint16_t carrier_freq;      // Carrier frequency (e.g., 38000 Hz for NEC)
-    uint8_t bits;               // Number of bits (e.g., 32 for NEC)
-} IR_Protocol_Params;
 
-// Standard protocols with their parameters
-const IR_Protocol_Params protocol_params[] = {
-    {"NEC", 38000, 32},
-    {"RC5", 36000, 12},
-    {"RC6", 36000, 20},
-    {"SONY", 40000, 12}
-};
 
+
+// --- DATA STRUCTURES ---
+
+// - IR PROTOCOL STRUCTURE -
 typedef struct {
     char name[32];                      // Protocol name (e.g., "NEC", "RC5")
     unsigned int *codes;                // Dynamic array of codes
@@ -80,18 +70,7 @@ typedef struct {
     uint8_t bits;                       // Number of bits for this protocol
 } IR_Protocol;
 
-// --- ESP32 IR STATE STRUCTURE ---
-typedef struct {
-    unsigned char ir_enabled;          // 1=enabled, 0=disabled
-    unsigned char ir_mode;             // 0=TX (transmitter), 1=RX (receiver)
-    unsigned int last_ir_code;         // Last transmitted/received IR code
-    unsigned char ir_protocol;         // Current protocol index
-    unsigned int ir_frequency;         // Carrier frequency in Hz
-} ESP32_IR_State;
-
-static ESP32_IR_State ir_state = {0};
-
-// --- STATE STRUCTURE ---
+// - STATE STRUCTURE -
 typedef struct {
     SceUID ir_pipe;
     SceUID resp_pipe;
@@ -115,34 +94,7 @@ typedef struct {
     int keyboard_cursor_y;      // Keyboard cursor position Y
 } IR_Controller_State;
 
-static IR_Controller_State state = {0};
-
-// --- PRESET IR CODES ---
-typedef struct {
-    char name[32];
-    unsigned int code;
-    unsigned char protocol;
-} IR_Preset;
-
-static IR_Preset presets[] = {
-    {"Power", 0x00FF40BF, IR_PROTOCOL_NEC},
-    {"Volume +", 0x00FF18E7, IR_PROTOCOL_NEC},
-    {"Volume -", 0x00FF10EF, IR_PROTOCOL_NEC},
-    {"Ch +", 0x00FF50AF, IR_PROTOCOL_NEC},
-    {"Ch -", 0x00FF48B7, IR_PROTOCOL_NEC},
-    {"Mute", 0x00FF20DF, IR_PROTOCOL_NEC},
-    {"Menu", 0x00FFE01F, IR_PROTOCOL_NEC},
-    {"OK", 0x00FF906F, IR_PROTOCOL_NEC},
-};
-
-#define PRESET_COUNT (sizeof(presets) / sizeof(presets[0]))
-
-// Dynamic protocol storage
-static IR_Protocol protocols[MAX_PROTOCOLS] = {0};
-static int protocol_count = 0;
-
-// --- IR CODE HISTORY ---
-#define HISTORY_SIZE 20
+// - IR CODE HISTORY -
 typedef struct {
     unsigned int code;
     unsigned char protocol;
@@ -150,14 +102,404 @@ typedef struct {
     unsigned int timestamp;
 } IR_History_Entry;
 
-static IR_History_Entry history[HISTORY_SIZE] = {0};
+// --- STATIC ALLOCATION ---
+
+// Dynamic protocol storage
+static int protocol_count = 0;
 static int history_count = 0;
 static int history_index = 0;
-
-// --- IR RESPONSE BUFFER ---
-#define IR_RESPONSE_BUFFER_SIZE 128
-static char ir_response_buffer[IR_RESPONSE_BUFFER_SIZE];
 static int ir_response_index = 0;
+
+
+static IR_Controller_State state = {0};
+static IR_Preset presets[] = {0}; // Max 100 presets
+
+
+// --- FORWARD DECLARATIONS ---
+
+void load_protocol_codes(int protocol_idx); // Forward declaration
+
+// --- LOADING CONFIGURATION FILE ---
+
+void load_config() {
+    SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_RDONLY, 0777);
+    if (fd >= 0) {
+        char file_buf[512]; // Buffer leggermente più grande per sicurezza
+        int bytesRead = sceIoRead(fd, file_buf, sizeof(file_buf) - 1);
+        if (bytesRead > 0) {
+            file_buf[bytesRead] = '\0';
+            
+            int mp, hs, ir, kc, cpp;
+            char def_name[32] = {0};
+
+            // sscanf cercherà i pattern nel buffer. 
+            // Usiamo %31s per leggere il nome del protocollo dopo "DEFAULT="
+            int matched = sscanf(file_buf, 
+                "MAX_PROTOCOLS=%d\n"
+                "HISTORY_SIZE=%d\n"
+                "IR_BUFFER=%d\n"
+                "COLS=%d\n"
+                "CODES_PER_PAGE=%d\n"
+                "DEFAULT=%31s", 
+                &mp, &hs, &ir, &kc, &cpp, def_name);
+
+            if (matched >= 5) {
+                MAX_PROTOCOLS = mp;
+                HISTORY_SIZE = hs;
+                KEYBOARD_COLS = kc;
+                CODES_PER_PAGE = cpp;
+                
+                // Protezione buffer IR
+                if (ir < MAX_BUFFER_SIZE) IR_RESPONSE_BUFFER_SIZE = ir;
+                else IR_RESPONSE_BUFFER_SIZE = MAX_BUFFER_SIZE - 1;
+
+                // Se abbiamo trovato anche il nome del protocollo DEFAULT (matched == 6)
+                if (matched == 6) {
+                    state.current_protocol_idx = 0; // Default di sicurezza
+                    
+                    // Cerchiamo quale indice corrisponde al nome letto
+                    for (int i = 0; i < protocol_count; i++) {
+                        if (strcmp(protocols[i].name, def_name) == 0) {
+                            state.current_protocol_idx = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        sceIoClose(fd);
+    } else {
+        save_default_protocol(0);
+    }
+}
+
+// --- THINGS --- after the actual loading of the configuration file
+
+static IR_Protocol protocols[MAX_PROTOCOLS] = {0};
+static IR_History_Entry history[HISTORY_SIZE] = {0};
+static char ir_response_buffer[IR_RESPONSE_BUFFER_SIZE];
+
+// --- TOUCHING THE IR CONFIGURATION FILE ---
+
+
+void save_default_protocol(int state.protocol_idx) {
+    SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    
+    if (fd >= 0) {
+        char buffer[512];
+
+        // 1. Righe 1-5: Configurazioni globali
+        snprintf(buffer, sizeof(buffer), 
+            "MAX_PROTOCOLS=%d\n"       // Riga 1
+            "HISTORY_SIZE=%d\n"        // Riga 2
+            "IR_BUFFER=%d\n"           // Riga 3
+            "COLS=%d\n"                // Riga 4
+            "CODES_PER_PAGE=%d\n",     // Riga 5
+            MAX_PROTOCOLS, 
+            HISTORY_SIZE, 
+            IR_RESPONSE_BUFFER_SIZE, 
+            KEYBOARD_COLS, 
+            CODES_PER_PAGE);
+        sceIoWrite(fd, buffer, strlen(buffer));
+
+        // 2. Riga 6: Il protocollo di default
+        char line6[64];
+        snprintf(line6, sizeof(line6), "DEFAULT=%s\n", protocols[protocol_idx].name);
+        sceIoWrite(fd, line6, strlen(line6));
+
+        // 3. Righe 7-10: Filler (per garantire che i protocolli inizino alla riga 11)
+        const char *filler = "UNUSED=0\nUNUSED=0\nUNUSED=0\nUNUSED=0\n";
+        sceIoWrite(fd, filler, strlen(filler));
+
+        // 4. Riga 11+: Blocchi protocolli (4 righe per protocollo)
+        for (int i = 0; i < protocol_count; i++) {
+            char proto_block[256];
+            snprintf(proto_block, sizeof(proto_block), 
+                "protocolName=%s\n"
+                "codeCount=%d\n"
+                "carrierFrequency=%d\n"
+                "bits=%d\n",
+                protocols[i].name, 
+                protocols[i].code_count,
+                protocols[i].carrier_freq, 
+                protocols[i].bits);
+            sceIoWrite(fd, proto_block, strlen(proto_block));
+        }
+
+        sceIoClose(fd);
+    }
+}
+
+
+int read_line(SceUID fd, char *buf, int max_len) {
+    int i = 0;
+    char c;
+    while (i < max_len - 1) {
+        if (sceIoRead(fd, &c, 1) <= 0) break;
+        if (c == '\r') continue; // Ignore Windows carriage returns
+        if (c == '\n') break;    // Stop at newline
+        buf[i++] = c;
+    }
+    buf[i] = '\0';
+    return i; // Returns length of line, 0 if empty/EOF
+}
+
+
+void load_protocol_from_config(int protocol_idx) {
+    SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_RDONLY, 0777);
+    if (fd < 0) return;
+
+    char line[128];
+    int current_line = 0;
+
+    // 1. Skip the first 10 lines (Global Config)
+    while (current_line < 10) {
+        if (read_line(fd, line, sizeof(line)) <= 0) {
+            sceIoClose(fd);
+            return; // End of file reached too early
+        }
+        current_line++;
+    }
+
+    // 2. Skip to the specific protocol block
+    // Each protocol block = 4 lines. We skip (protocol_idx * 4) lines.
+    int lines_to_skip = protocol_idx * 4;
+    for (int i = 0; i < lines_to_skip; i++) {
+        if (read_line(fd, line, sizeof(line)) <= 0) {
+            sceIoClose(fd);
+            return;
+        }
+    }
+
+    // 3. Read the 4 lines for the current protocol
+    char name_line[64], count_line[64], freq_line[64], bits_line[64];
+    
+    if (read_line(fd, name_line, sizeof(name_line)) > 0 &&
+        read_line(fd, count_line, sizeof(count_line)) > 0 &&
+        read_line(fd, freq_line, sizeof(freq_line)) > 0 &&
+        read_line(fd, bits_line, sizeof(bits_line)) > 0) {
+
+        // Parse keys: protocolName=, codeCount=, carrierFrequency=, bits=
+        sscanf(name_line, "protocolName=%31s", protocols[protocol_idx].name);
+        sscanf(count_line, "codeCount=%d", &protocols[protocol_idx].code_count);
+        
+        int temp_freq, temp_bits;
+        sscanf(freq_line, "carrierFrequency=%d", &temp_freq);
+        sscanf(bits_line, "bits=%d", &temp_bits);
+        
+        protocols[protocol_idx].carrier_freq = (uint16_t)temp_freq;
+        protocols[protocol_idx].bits = (uint8_t)temp_bits;
+        
+        // Note: Initialize your dynamic arrays here if needed
+        protocols[protocol_idx].codes = NULL; 
+        protocols[protocol_idx].code_names = NULL;
+    }
+
+    sceIoClose(fd);
+}
+
+
+// --- TOUCHING THE IR DATA FILE ---
+
+void scan_protocols(void) {
+    SceUID dir = sceIoDopen(IR_DATA_DIR);
+    if (dir >= 0) {
+        SceIoDirent entry;
+        protocol_count = 0;
+        
+        while (sceIoDread(dir, &entry) > 0 && protocol_count < MAX_PROTOCOLS) {
+            if (!FIO_S_ISDIR(entry.d_stat.st_mode)) {
+                char *filename = entry.d_name;
+                
+                // Check if file ends with "_codes.txt"
+                if (strstr(filename, "_codes.txt") != NULL) {
+                    // Extract protocol name from filename
+                    char proto_name[32] = {0};
+                    int len = strlen(filename) - strlen("_codes.txt");
+                    if (len > 0 && len < sizeof(proto_name)) {
+                        strncpy(proto_name, filename, len);
+                        proto_name[len] = '\0';
+                        
+                        // Convert to uppercase
+                        for (int i = 0; proto_name[i]; i++) {
+                            proto_name[i] = (proto_name[i] >= 'a' && proto_name[i] <= 'z') ? 
+                                           proto_name[i] - 32 : proto_name[i];
+                        }
+                        
+                        // Add to protocol list
+                        strncpy(protocols[protocol_count].name, proto_name, 31);
+                        snprintf(protocols[protocol_count].filename, sizeof(protocols[protocol_count].filename),
+                                "%s%s", IR_DATA_DIR, filename);
+                        
+                        // Load codes from file (includes parameters from first two lines)
+                        load_protocol_codes(protocol_count);
+                        
+                        protocol_count++;
+                    }
+                }
+            }
+        }
+        sceIoDclose(dir);
+    }
+}
+
+void load_protocol_codes(int protocol_idx) {
+    if (protocol_idx < 0 || protocol_idx >= MAX_PROTOCOLS) return;
+    
+    SceUID fd = sceIoOpen(protocols[protocol_idx].filename, PSP_O_RDONLY, 0);
+    if (fd < 0) return;
+
+    // Reset counts for this protocol
+    protocols[protocol_idx].code_count = 0;
+    
+    char line[128];
+    int line_num = 0;
+    
+    // Process remaining lines: "Name -> 0xCODE"
+    while (read_line(fd, line, sizeof(line)) > 0) {
+        unsigned int code = 0;
+        char code_name[64] = {0};
+        
+        char *arrow = strstr(line, "->");
+        if (arrow != NULL) {
+            // Extract Name
+            int name_len = arrow - line;
+            if (name_len > 63) name_len = 63;
+            strncpy(code_name, line, name_len);
+            code_name[name_len] = '\0';
+            
+            // Trim trailing spaces
+            while (name_len > 0 && code_name[name_len-1] == ' ') code_name[--name_len] = '\0';
+
+            // Extract Hex Code
+            sscanf(arrow + 2, " %x", &code);
+        } else {
+            // No arrow, treat whole line as hex or skip
+            if (sscanf(line, "%x", &code) != 1) continue;
+            snprintf(code_name, sizeof(code_name), "Code_%d", protocols[protocol_idx].code_count + 1);
+        }
+
+        // --- DYNAMIC REALLOCATION ---
+        if (protocols[protocol_idx].code_count >= protocols[protocol_idx].code_capacity) {
+            int new_cap = (protocols[protocol_idx].code_capacity == 0) ? 16 : protocols[protocol_idx].code_capacity * 2;
+            
+            unsigned int *new_codes = realloc(protocols[protocol_idx].codes, new_cap * sizeof(unsigned int));
+            char **new_names = realloc(protocols[protocol_idx].code_names, new_cap * sizeof(char *));
+            
+            if (new_codes && new_names) {
+                protocols[protocol_idx].codes = new_codes;
+                protocols[protocol_idx].code_names = new_names;
+                protocols[protocol_idx].code_capacity = new_cap;
+            } else {
+                break; // Memory failure
+            }
+        }
+
+        // --- STORAGE ---
+        protocols[protocol_idx].codes[protocols[protocol_idx].code_count] = code;
+        protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] = strdup(code_name);
+        protocols[protocol_idx].code_count++;
+    }
+    sceIoClose(fd);
+}
+
+int find_protocol_file_by_name(const char *target_name, char *out_full_path) {
+    SceUID dfd = sceIoDopen(IR_DATA_DIR);
+    if (dfd < 0) {
+        // Directory doesn't exist or cannot be opened
+        return -1; 
+    }
+
+    SceIoDirent entry;
+    memset(&entry, 0, sizeof(SceIoDirent));
+
+    // Iterate through all files in the directory
+    while (sceIoDread(dfd, &entry) > 0) {
+        // Check if the file name matches the protocol name (case-sensitive)
+        // Note: You may want to check for .txt or other extensions specifically
+        if (strcmp(entry.d_name, target_name) == 0) {
+            snprintf(out_full_path, 256, "%s%s", IR_DATA_DIR, entry.d_name);
+            sceIoDclose(dfd);
+            return 0; // Found it
+        }
+    }
+
+    sceIoDclose(dfd);
+    return -2; // Not found
+}
+
+void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const char *code_name) {
+    if (protocol_idx < 0 || protocol_idx >= protocol_count) return;
+    
+    char found_path[256];
+    // Search the directory for the protocol's filename before saving
+    if (find_protocol_file_by_name(protocols[protocol_idx].name, found_path) == 0) {
+        // Update the internal path to the one found in the search
+        strncpy(protocols[protocol_idx].filename, found_path, sizeof(protocols[protocol_idx].filename));
+    } else {
+        // If not found, use a default path in the IR_DATA_DIR
+        snprintf(protocols[protocol_idx].filename, sizeof(protocols[protocol_idx].filename), 
+                 "%s%s.txt", IR_DATA_DIR, protocols[protocol_idx].name);
+    }
+
+    // Expand arrays if needed
+    if (protocols[protocol_idx].code_count >= protocols[protocol_idx].code_capacity) {
+        int new_capacity = (protocols[protocol_idx].code_capacity == 0) ? 16 : 
+                          protocols[protocol_idx].code_capacity * 2;
+        
+        // Expand codes array
+        unsigned int *new_codes = (unsigned int *)realloc(protocols[protocol_idx].codes, 
+                                                          new_capacity * sizeof(unsigned int));
+        if (new_codes == NULL) {
+            snprintf(state.status_msg, sizeof(state.status_msg), "Memory allocation failed!");
+            return;
+        }
+        protocols[protocol_idx].codes = new_codes;
+        
+        // Expand names array
+        char **new_names = (char **)realloc(protocols[protocol_idx].code_names, new_capacity * sizeof(char *));
+        if (new_names == NULL) {
+            snprintf(state.status_msg, sizeof(state.status_msg), "Memory allocation failed!");
+            return;
+        }
+        protocols[protocol_idx].code_names = new_names;
+        
+        protocols[protocol_idx].code_capacity = new_capacity;
+    }
+    
+    // Add code to memory
+    protocols[protocol_idx].codes[protocols[protocol_idx].code_count] = code;
+    
+    // Generate name for received code
+    char final_name[96];
+    if (code_name != NULL && strlen(code_name) > 0) {
+        strcpy(final_name, code_name);
+    } else {
+        snprintf(final_name, sizeof(final_name), "Code_%d", protocols[protocol_idx].code_count + 1);
+    }
+    
+    protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] = (char *)malloc(strlen(final_name) + 1);
+    if (protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] != NULL) {
+        strcpy(protocols[protocol_idx].code_names[protocols[protocol_idx].code_count], final_name);
+    }
+    
+    protocols[protocol_idx].code_count++;
+    
+    // Save to file
+    SceUID fd = sceIoOpen(protocols[protocol_idx].filename, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    
+    if (fd >= 0) {
+        char line[128];
+        snprintf(line, sizeof(line), "%s -> 0x%08X\n", final_name, code);
+        sceIoWrite(fd, line, strlen(line));
+        sceIoClose(fd);
+        
+        snprintf(state.status_msg, sizeof(state.status_msg), "Saved '%s' to %s", 
+                 final_name, protocols[protocol_idx].name);
+    } else {
+        snprintf(state.status_msg, sizeof(state.status_msg), "Error saving file!");
+    }
+}
 
 // --- IR RESPONSE PARSER ---
 // This plugin now parses responses from IR commands
@@ -288,267 +630,6 @@ void transmit_ir_code(unsigned int code) {
     }
 }
 
-// --- FILE I/O FUNCTIONS ---
-void create_data_directory(void) {
-    // Create ms0:/game/ircontroller/ if it doesn't exist
-    sceIoMkdir(IR_DATA_DIR, 0777);
-}
-
-void scan_protocols(void) {
-    SceUID dir = sceIoDopen(IR_DATA_DIR);
-    if (dir >= 0) {
-        SceIoDirent entry;
-        protocol_count = 0;
-        
-        while (sceIoDread(dir, &entry) > 0 && protocol_count < MAX_PROTOCOLS) {
-            if (!FIO_S_ISDIR(entry.d_stat.st_mode)) {
-                char *filename = entry.d_name;
-                
-                // Check if file ends with "_codes.txt"
-                if (strstr(filename, "_codes.txt") != NULL) {
-                    // Extract protocol name from filename
-                    char proto_name[32] = {0};
-                    int len = strlen(filename) - strlen("_codes.txt");
-                    if (len > 0 && len < sizeof(proto_name)) {
-                        strncpy(proto_name, filename, len);
-                        proto_name[len] = '\0';
-                        
-                        // Convert to uppercase
-                        for (int i = 0; proto_name[i]; i++) {
-                            proto_name[i] = (proto_name[i] >= 'a' && proto_name[i] <= 'z') ? 
-                                           proto_name[i] - 32 : proto_name[i];
-                        }
-                        
-                        // Add to protocol list
-                        strncpy(protocols[protocol_count].name, proto_name, 31);
-                        snprintf(protocols[protocol_count].filename, sizeof(protocols[protocol_count].filename),
-                                "%s%s", IR_DATA_DIR, filename);
-                        
-                        // Load codes from file (includes parameters from first two lines)
-                        load_protocol_codes(protocol_count);
-                        
-                        protocol_count++;
-                    }
-                }
-            }
-        }
-        sceIoDclose(dir);
-    }
-}
-
-void load_protocol_codes(int protocol_idx);  // Forward declaration
-
-void save_code_to_protocol(unsigned int code, int protocol_idx) {
-    // Save code with default name
-    save_code_to_protocol_with_name(code, protocol_idx, "");
-}
-
-void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const char *code_name);  // Forward declaration
-
-void load_protocol_codes(int protocol_idx) {
-    if (protocol_idx < 0 || protocol_idx >= protocol_count) return;
-    
-    SceUID fd = sceIoOpen(protocols[protocol_idx].filename, PSP_O_RDONLY, 0);
-    protocols[protocol_idx].code_count = 0;
-    protocols[protocol_idx].code_capacity = 0;
-    
-    // Initialize with default parameters
-    protocols[protocol_idx].carrier_freq = 38000;
-    protocols[protocol_idx].bits = 32;
-    
-    if (fd >= 0) {
-        char line[128];
-        int bytes_read;
-        int line_num = 0;
-        
-        while ((bytes_read = sceIoRead(fd, line, sizeof(line) - 1)) > 0) {
-            line[bytes_read] = '\0';
-            
-            // Remove trailing newline/carriage return
-            while (bytes_read > 0 && (line[bytes_read - 1] == '\n' || line[bytes_read - 1] == '\r')) {
-                line[--bytes_read] = '\0';
-            }
-            
-            // First two lines are parameters: carrier_freq and bits
-            if (line_num == 0) {
-                // First line: carrier frequency
-                uint16_t carrier = 0;
-                if (sscanf(line, "%hu", &carrier) == 1) {
-                    protocols[protocol_idx].carrier_freq = carrier;
-                }
-                line_num++;
-                continue;
-            } else if (line_num == 1) {
-                // Second line: bit count
-                uint8_t bits = 0;
-                if (sscanf(line, "%hhu", &bits) == 1) {
-                    protocols[protocol_idx].bits = bits;
-                }
-                line_num++;
-                continue;
-            }
-            
-            // Remaining lines are: Name -> 0xCODE
-            unsigned int code = 0;
-            char code_name[96] = {0};
-            
-            // Try to parse: Name -> 0xCODE
-            char *arrow = strstr(line, "->");
-            if (arrow != NULL) {
-                // Extract name (before arrow)
-                int name_len = arrow - line;
-                if (name_len > 0 && name_len < sizeof(code_name)) {
-                    strncpy(code_name, line, name_len);
-                    code_name[name_len] = '\0';
-                    
-                    // Trim whitespace from name
-                    while (name_len > 0 && code_name[name_len - 1] == ' ') {
-                        code_name[--name_len] = '\0';
-                    }
-                }
-                
-                // Extract code (after arrow)
-                if (sscanf(arrow + 2, "%x", &code) == 1) {
-                    // Valid code found
-                } else {
-                    continue; // Skip malformed lines
-                }
-            } else {
-                // No arrow, just try to parse as hex code
-                if (sscanf(line, "%x", &code) != 1) {
-                    continue;
-                }
-            }
-            
-            // Expand arrays if needed
-            if (protocols[protocol_idx].code_count >= protocols[protocol_idx].code_capacity) {
-                int new_capacity = (protocols[protocol_idx].code_capacity == 0) ? 16 : 
-                                  protocols[protocol_idx].code_capacity * 2;
-                
-                // Expand codes array
-                unsigned int *new_codes = (unsigned int *)realloc(protocols[protocol_idx].codes, 
-                                                                  new_capacity * sizeof(unsigned int));
-                if (new_codes == NULL) break;
-                protocols[protocol_idx].codes = new_codes;
-                
-                // Expand names array
-                char **new_names = (char **)realloc(protocols[protocol_idx].code_names, 
-                                                   new_capacity * sizeof(char *));
-                if (new_names == NULL) break;
-                protocols[protocol_idx].code_names = new_names;
-                
-                protocols[protocol_idx].code_capacity = new_capacity;
-            }
-            
-            // Store code
-            protocols[protocol_idx].codes[protocols[protocol_idx].code_count] = code;
-            
-            // Store name (allocate and copy)
-            int name_len = strlen(code_name);
-            protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] = 
-                (char *)malloc(name_len + 1);
-            if (protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] != NULL) {
-                strcpy(protocols[protocol_idx].code_names[protocols[protocol_idx].code_count], code_name);
-            }
-            
-            protocols[protocol_idx].code_count++;
-        }
-        sceIoClose(fd);
-    }
-}
-
-void save_code_to_protocol_with_name(unsigned int code, int protocol_idx, const char *code_name) {
-    if (protocol_idx < 0 || protocol_idx >= protocol_count) return;
-    
-    // Expand arrays if needed
-    if (protocols[protocol_idx].code_count >= protocols[protocol_idx].code_capacity) {
-        int new_capacity = (protocols[protocol_idx].code_capacity == 0) ? 16 : 
-                          protocols[protocol_idx].code_capacity * 2;
-        
-        // Expand codes array
-        unsigned int *new_codes = (unsigned int *)realloc(protocols[protocol_idx].codes, 
-                                                          new_capacity * sizeof(unsigned int));
-        if (new_codes == NULL) {
-            snprintf(state.status_msg, sizeof(state.status_msg), "Memory allocation failed!");
-            return;
-        }
-        protocols[protocol_idx].codes = new_codes;
-        
-        // Expand names array
-        char **new_names = (char **)realloc(protocols[protocol_idx].code_names, new_capacity * sizeof(char *));
-        if (new_names == NULL) {
-            snprintf(state.status_msg, sizeof(state.status_msg), "Memory allocation failed!");
-            return;
-        }
-        protocols[protocol_idx].code_names = new_names;
-        
-        protocols[protocol_idx].code_capacity = new_capacity;
-    }
-    
-    // Add code to memory
-    protocols[protocol_idx].codes[protocols[protocol_idx].code_count] = code;
-    
-    // Generate name for received code
-    char final_name[96];
-    if (code_name != NULL && strlen(code_name) > 0) {
-        strcpy(final_name, code_name);
-    } else {
-        snprintf(final_name, sizeof(final_name), "Code_%d", protocols[protocol_idx].code_count + 1);
-    }
-    
-    protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] = (char *)malloc(strlen(final_name) + 1);
-    if (protocols[protocol_idx].code_names[protocols[protocol_idx].code_count] != NULL) {
-        strcpy(protocols[protocol_idx].code_names[protocols[protocol_idx].code_count], final_name);
-    }
-    
-    protocols[protocol_idx].code_count++;
-    
-    // Save to file
-    SceUID fd = sceIoOpen(protocols[protocol_idx].filename, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
-    
-    if (fd >= 0) {
-        char line[128];
-        snprintf(line, sizeof(line), "%s -> 0x%08X\n", final_name, code);
-        sceIoWrite(fd, line, strlen(line));
-        sceIoClose(fd);
-        
-        snprintf(state.status_msg, sizeof(state.status_msg), "Saved '%s' to %s", 
-                 final_name, protocols[protocol_idx].name);
-    } else {
-        snprintf(state.status_msg, sizeof(state.status_msg), "Error saving file!");
-    }
-}
-
-void save_default_protocol(int protocol_idx) {
-    SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    
-    if (fd >= 0) {
-        char line[32];
-        snprintf(line, sizeof(line), "%d\n", protocol_idx);
-        sceIoWrite(fd, line, strlen(line));
-        sceIoClose(fd);
-    }
-}
-
-void load_default_protocol(void) {
-    SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_RDONLY, 0);
-    
-    state.current_protocol_idx = 0; // Default to first protocol
-    
-    if (fd >= 0) {
-        char line[32];
-        int bytes_read = sceIoRead(fd, line, sizeof(line) - 1);
-        if (bytes_read > 0) {
-            line[bytes_read] = '\0';
-            int idx = 0;
-            if (sscanf(line, "%d", &idx) == 1 && idx >= 0 && idx < protocol_count) {
-                state.current_protocol_idx = idx;
-            }
-        }
-        sceIoClose(fd);
-    }
-}
-
 void set_ir_mode_tx(void) {
     send_ir_command("IR:MODE:TX");
     state.ir_mode = IR_MODE_TX;
@@ -564,12 +645,12 @@ void set_ir_mode_rx(void) {
 void send_protocol_parameters(int protocol_idx) {
     // Send protocol parameters to ESP32
     // Command: IR+PROTO=<name>,<carrier_freq>,<bits>
+    // I send the protocol parameters to ESP32 even if the name is not used by ESP32, but in a future it could be useful for debugging or by having specific behaviors for certain protocols on ESP32 side like routing to different decoders? or different modulation schemes? or different hardware sending methods like for home automation? but it's not implemented now and can be deprecated in the future.
     if (protocol_idx >= 0 && protocol_idx < protocol_count) {
         IR_Protocol *proto = &protocols[protocol_idx];
         
         char cmd[96];
-        snprintf(cmd, sizeof(cmd), "IR+PROTO=%s,%d,%d", 
-                 proto->name, proto->carrier_freq, proto->bits);
+        snprintf(cmd, sizeof(cmd), "IR+PROTO=%d,%d", proto->carrier_freq, proto->bits);
         
         send_ir_command(cmd);
     }
@@ -588,10 +669,12 @@ void set_ir_protocol(int protocol_idx) {
 }
 
 // --- KEYBOARD INPUT ---
+// Simple on-screen keyboard for naming received codes
+// Layout: the number of columns is defined by KEYBOARD_COLS in a .ini file
+// Characters: A-Z only Uppercase, 0-9, space
+// In the future, we could expand this to include more characters or symbols if needed and i feel the necessity, maibe by having it in the .ini file? .
+
 const char keyboard_layout[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
-#define KEYBOARD_WIDTH 10
-#define KEYBOARD_HEIGHT 4
-#define KEYBOARD_COLS 10
 
 void render_keyboard(void) {
     pspDebugScreenClear();
@@ -704,7 +787,7 @@ void handle_input(SceCtrlData *pad) {
     if (state.menu_state == 0) {
         // Main menu - load and transmit codes from current protocol
         int current_code_count = protocols[state.current_protocol_idx].code_count;
-        int codes_per_page = 10;
+        // int codes_per_page = 10; moved to the define section
         int total_pages = (current_code_count > 0) ? (current_code_count + codes_per_page - 1) / codes_per_page : 1;
         int page_start = state.current_page * codes_per_page;
         int page_end = (state.current_page + 1) * codes_per_page;
@@ -713,20 +796,44 @@ void handle_input(SceCtrlData *pad) {
         if (pad->Buttons & PSP_CTRL_UP && state.selected_preset > 0) {
             state.selected_preset--;
             sceKernelDelayThread(150000);
+        }else if (pad -> Buttons & PSP_CTRL_UP && state.selected_preset == 0 && state.current_page > 0)
+        {
+            state.current_page--;
+            state.selected_preset = codes_per_page -1;
+            sceKernelDelayThread(150000);
+        }else if (pad -> Buttons & PSP_CTRL_UP && state.selected_preset == 0 && state.current_page == 0)
+        {
+            state.current_page = total_pages -1;
+            int last_page_count = current_code_count % codes_per_page;
+            if (last_page_count == 0)
+                state.selected_preset = codes_per_page -1;
+            else
+                state.selected_preset = last_page_count -1;
+
+            sceKernelDelayThread(150000);
         }
+
         if (pad->Buttons & PSP_CTRL_DOWN && state.selected_preset < page_end - page_start - 1) {
             state.selected_preset++;
+            sceKernelDelayThread(150000);
+        } else if (pad -> Buttons & PSP_CTRL_DOWN && state.selected_preset == page_end - page_start -1 && state.current_page < total_pages -1)
+        {
+            state.current_page++;
+            state.selected_preset = 0;
+            sceKernelDelayThread(150000);
+        } else if (pad -> Buttons & PSP_CTRL_DOWN && state.selected_preset == page_end - page_start -1 && state.current_page == total_pages -1)
+        {
+            state.current_page = 0;
+            state.selected_preset = 0;
             sceKernelDelayThread(150000);
         }
         
         if (pad->Buttons & PSP_CTRL_LEFT && state.current_page > 0) {
             state.current_page--;
-            state.selected_preset = 0;
             sceKernelDelayThread(200000);
         }
         if (pad->Buttons & PSP_CTRL_RIGHT && state.current_page < total_pages - 1) {
             state.current_page++;
-            state.selected_preset = 0;
             sceKernelDelayThread(200000);
         }
         
@@ -757,7 +864,7 @@ void handle_input(SceCtrlData *pad) {
             }
             
             if (pad->Buttons & PSP_CTRL_SQUARE) {
-                // need to resend the current code that is viewed
+                // need to resend the current code that is viewed ti verify if the code is correct
                 unsigned int code = protocols[state.current_protocol_idx].codes[page_start + state.selected_preset];
                 transmit_ir_code(code);
                 sceKernelDelayThread(300000);
@@ -770,11 +877,9 @@ void handle_input(SceCtrlData *pad) {
                 state.keyboard_cursor_x = 0;
                 state.keyboard_cursor_y = 0;
 
-                if (state.current_code != 0) {
-                    save_code_to_protocol(state.current_code, state.current_protocol_idx);
-                }
                 sceKernelDelayThread(300000);
             }
+            
         }
     }
     
@@ -806,7 +911,15 @@ void handle_input(SceCtrlData *pad) {
         if (pad->Buttons & PSP_CTRL_START) {
             state.menu_state = 0; // Back to main menu
             sceKernelDelayThread(300000);
+        }
     }
+}
+
+void modify_ESP32_mode(){
+    if(state.menu_state == 1){
+        send_ir_command("IR+MODE+RX");
+    }else
+        send_ir_command("IR+MODE+TX");
 }
 
 // --- DISPLAY RENDERING ---
@@ -896,7 +1009,6 @@ void render_receive_menu(void) {
             debug_print(10, 50, "Status: RECEIVING...", 0xFF00FF00);
             debug_print(10, 65, "Waiting for IR codes...", 0xFFFFFFFF);
             
-            if ()
             char proto_str[80];
             snprintf(proto_str, sizeof(proto_str), "Saving to: %s", get_protocol_name(state.current_protocol_idx));
             debug_print(10, 85, proto_str, 0xFF00FFFF);
@@ -906,7 +1018,7 @@ void render_receive_menu(void) {
                 snprintf(code_str, sizeof(code_str), "Last Code: 0x%08X", state.current_code);
                 debug_print(10, 105, code_str, 0xFF00FFFF);
                 
-                debug_print(10, 225, "L: Name & Save  |  SQUARE: Send code to test  |  L/R: Change Menu", 0xFF888888);
+                debug_print(10, 225, "Circle Save: Name & Save  |  SQUARE: Send code to test  |  L/R: Change Menu", 0xFF888888);
             } else {
                 debug_print(10, 225, "Waiting for IR signal...  |  SQUARE: Exit RX  |  L/R: Menu", 0xFF888888);
             }
@@ -995,6 +1107,8 @@ int main_thread(SceSize args, void *argp) {
         return -1;
     }
     
+    load_config();
+    load_protocols();
 
     // Open message pipe to UART Manager
     state.cmd_pipe = sceKernelCreateMsgPipe("SioCmdPipe", 1, 0, 256, NULL);
@@ -1035,6 +1149,7 @@ int main_thread(SceSize args, void *argp) {
         // Read controller input
         sceCtrlReadBufferPositive(&pad, 1);
         handle_input(&pad);
+        modify_ESP32_mode();
         
         // Render appropriate menu
         if (state.menu_state == 3) {
