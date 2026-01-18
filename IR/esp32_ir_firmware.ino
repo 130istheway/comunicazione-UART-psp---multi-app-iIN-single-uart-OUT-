@@ -93,16 +93,16 @@ void loop() {
 }
 
 void handle_at_command(char *cmd) {
-  // Parse AT commands from PSP
+  // Parse IR commands from PSP
   
-  // AT+IRPROTO=<name>,<carrier_freq>,<bits>
-  // Example: AT+IRPROTO=NEC,38000,32
-  if (strncmp(cmd, "AT+IRPROTO=", 11) == 0) {
+  // IR+PROTO=<name>,<carrier_freq>,<bits>
+  // Example: IR+PROTO=NEC,38000,32
+  if (strncmp(cmd, "IR+PROTO=", 11) == 0) {
     char proto_name[32];
     uint16_t carrier = 0;
     uint8_t bits = 0;
     
-    if (sscanf(cmd, "AT+IRPROTO=%31[^,],%hu,%hhu", proto_name, &carrier, &bits) == 3) {
+    if (sscanf(cmd, "IR+PROTO=%31[^,],%hu,%hhu", proto_name, &carrier, &bits) == 3) {
       strcpy(current_protocol.name, proto_name);
       current_protocol.carrier_freq = carrier;
       current_protocol.bits = bits;
@@ -116,51 +116,51 @@ void handle_at_command(char *cmd) {
     }
   }
   
-  // AT+IRTX=<code>
+  // IR+TX=<code>
   // Uses current protocol parameters
-  else if (strncmp(cmd, "AT+IRTX=", 8) == 0) {
+  else if (strncmp(cmd, "IR+TX=", 8) == 0) {
     unsigned long code = 0;
     
-    // Parse: AT+IRTX=<code>
-    if (sscanf(cmd, "AT+IRTX=%lX", &code) == 1) {
+    // Parse: IR+TX=<code>
+    if (sscanf(cmd, "IR+TX=%lX", &code) == 1) {
       send_ir_code(code);
-      send_response("AT+OK");
+      send_response("IR+OK");
     } else {
-      send_response("AT+ERROR:PARSE");
+      send_response("IR+ERROR:PARSE");
     }
   }
   
-  // AT+IRRX - Enable IR receive mode
-  else if (strcmp(cmd, "AT+IRRX") == 0) {
+  // IR+RX - Enable IR receive mode
+  else if (strcmp(cmd, "IR+RX") == 0) {
     enable_ir_rx();
-    send_response("AT+IRRX:ENABLED");
+    send_response("IR+RX:ENABLED");
   }
   
-  // AT+IRTX - Disable IR receive mode (switch to TX)
-  else if (strcmp(cmd, "AT+IRTX") == 0) {
+  // IR+TX - Disable IR receive mode (switch to TX)
+  else if (strcmp(cmd, "IR+TX") == 0) {
     disable_ir_rx();
-    send_response("AT+IRTX:ENABLED");
+    send_response("IR+TX:ENABLED");
   }
   
-  // AT+RST - Reset
-  else if (strcmp(cmd, "AT+RST") == 0) {
-    send_response("AT+RESET");
+  // IR+RST - Reset
+  else if (strcmp(cmd, "IR+RST") == 0) {
+    send_response("IR+RESET");
     delay(1000);
     ESP.restart();
   }
   
-  // AT+STATUS - Get status
-  else if (strcmp(cmd, "AT+STATUS") == 0) {
+  // IR+STATUS - Get status
+  else if (strcmp(cmd, "IR+STATUS") == 0) {
     if (ir_rx_enabled) {
-      send_response("AT+STATUS:RX_MODE");
+      send_response("IR+STATUS:RX_MODE");
     } else {
-      send_response("AT+STATUS:TX_MODE");
+      send_response("IR+STATUS:TX_MODE");
     }
   }
   
   // Unknown command
   else {
-    send_response("AT+ERROR:UNKNOWN");
+    send_response("IR+ERROR:UNKNOWN");
   }
 }
 
@@ -176,7 +176,7 @@ void send_ir_code(unsigned long code) {
   
   // Log transmission with protocol info
   char response[80];
-  snprintf(response, sizeof(response), "AT+IRTX:SENT:0x%08lX [%s]", code, current_protocol.name);
+  snprintf(response, sizeof(response), "IR+TX:SENT:0x%08lX [%s]", code, current_protocol.name);
   send_response(response);
 }
 
@@ -192,31 +192,12 @@ void disable_ir_rx() {
 
 void process_ir_reception() {
   if (irrecv.decode(&results)) {
-    unsigned long code = results.value;
-    uint8_t protocol = PROTOCOL_NEC; // Default to NEC
-    
-    // Determine protocol from decode type
-    switch (results.decode_type) {
-      case NEC:
-        protocol = PROTOCOL_NEC;
-        break;
-      case RC5:
-        protocol = PROTOCOL_RC5;
-        break;
-      case RC6:
-        protocol = PROTOCOL_RC6;
-        break;
-      case SONY:
-        protocol = PROTOCOL_SONY;
-        break;
-      default:
-        protocol = PROTOCOL_NEC;
-        break;
-    }
+    // the protocol data come from the psp plugin
+    // maube can be done in automatic but i dont think
     
     // Send received code to PSP
     char response[64];
-    snprintf(response, sizeof(response), "AT+IRRX:CODE:0x%08lX,%d", code, protocol);
+    snprintf(response, sizeof(response), "IR+RX:CODE:0x%08lX,%d", code, protocol);
     send_response(response);
     
     // Resume receiver

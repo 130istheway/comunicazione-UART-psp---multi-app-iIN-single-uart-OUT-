@@ -46,19 +46,20 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define IR_MODE_TX 0
 #define IR_MODE_RX 1
 
-// --- IR CONFIGURATION DEFINITIONS ---
+// --- DATA STRUCTURES ---
+
+// - IR PROTOCOL STRUCTURE -
+
+typedef struct{
 unsigned int MAX_PROTOCOLS = 16;
 unsigned int HISTORY_SIZE = 20;
 unsigned int IR_RESPONSE_BUFFER_SIZE = 128;
 unsigned int KEYBOARD_COLS = 10;
-unsigend int CODES_PER_PAGE = 10;
+unsigned int CODES_PER_PAGE = 10;
+} IR_Config;
 
+IR_config g_ir_config = {16, 20, 138, 10, 10};
 
-
-
-// --- DATA STRUCTURES ---
-
-// - IR PROTOCOL STRUCTURE -
 typedef struct {
     char name[32];                      // Protocol name (e.g., "NEC", "RC5")
     unsigned int *codes;                // Dynamic array of codes
@@ -109,11 +110,8 @@ static int protocol_count = 0;
 static int history_count = 0;
 static int history_index = 0;
 static int ir_response_index = 0;
-
-
 static IR_Controller_State state = {0};
-static IR_Preset presets[] = {0}; // Max 100 presets
-
+const char keyboard_layout[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 
 // --- FORWARD DECLARATIONS ---
 
@@ -144,14 +142,14 @@ void load_config() {
                 &mp, &hs, &ir, &kc, &cpp, def_name);
 
             if (matched >= 5) {
-                MAX_PROTOCOLS = mp;
-                HISTORY_SIZE = hs;
-                KEYBOARD_COLS = kc;
-                CODES_PER_PAGE = cpp;
+                g_ir_config.MAX_PROTOCOL = mp;
+                g_ir_config.HYSTORY_SIZE = hs;
+                g_ir_config.KEYBOARD_COLS = kc;
+                g_ir_config.CODES_PER_PAGE = cpp;
                 
                 // Protezione buffer IR
-                if (ir < MAX_BUFFER_SIZE) IR_RESPONSE_BUFFER_SIZE = ir;
-                else IR_RESPONSE_BUFFER_SIZE = MAX_BUFFER_SIZE - 1;
+                if (ir < MAX_BUFFER_SIZE) g_ir_config.IR_RESPONSE_BUFFER_SIZE = ir;
+                else g_ir_config.IR_RESPONSE_BUFFER_SIZE = MAX_BUFFER_SIZE - 1;
 
                 // Se abbiamo trovato anche il nome del protocollo DEFAULT (matched == 6)
                 if (matched == 6) {
@@ -175,12 +173,11 @@ void load_config() {
 
 // --- THINGS --- after the actual loading of the configuration file
 
-static IR_Protocol protocols[MAX_PROTOCOLS] = {0};
-static IR_History_Entry history[HISTORY_SIZE] = {0};
-static char ir_response_buffer[IR_RESPONSE_BUFFER_SIZE];
+static IR_Protocol protocols[g_ir_config.MAX_PROTOCOLS] = {0};
+static IR_History_Entry history[g_ir_config.HISTORY_SIZE] = {0};
+static char ir_response_buffer[g_ir_config.IR_RESPONSE_BUFFER_SIZE];
 
 // --- TOUCHING THE IR CONFIGURATION FILE ---
-
 
 void save_default_protocol(int state.protocol_idx) {
     SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
@@ -195,11 +192,11 @@ void save_default_protocol(int state.protocol_idx) {
             "IR_BUFFER=%d\n"           // Riga 3
             "COLS=%d\n"                // Riga 4
             "CODES_PER_PAGE=%d\n",     // Riga 5
-            MAX_PROTOCOLS, 
-            HISTORY_SIZE, 
-            IR_RESPONSE_BUFFER_SIZE, 
-            KEYBOARD_COLS, 
-            CODES_PER_PAGE);
+            g_ir_config.MAX_PROTOCOLS, 
+            g_ir_config.HISTORY_SIZE, 
+            g_ir_config.IR_RESPONSE_BUFFER_SIZE, 
+            g_ir_config.KEYBOARD_COLS, 
+            g_ir_config.CODES_PER_PAGE);
         sceIoWrite(fd, buffer, strlen(buffer));
 
         // 2. Riga 6: Il protocollo di default
@@ -230,20 +227,18 @@ void save_default_protocol(int state.protocol_idx) {
     }
 }
 
-
 int read_line(SceUID fd, char *buf, int max_len) {
     int i = 0;
     char c;
     while (i < max_len - 1) {
         if (sceIoRead(fd, &c, 1) <= 0) break;
-        if (c == '\r') continue; // Ignore Windows carriage returns
+        if (c == '\r') continue; // Ignore carriage returns
         if (c == '\n') break;    // Stop at newline
         buf[i++] = c;
     }
     buf[i] = '\0';
     return i; // Returns length of line, 0 if empty/EOF
 }
-
 
 void load_protocol_from_config(int protocol_idx) {
     SceUID fd = sceIoOpen(IR_CONFIG_FILE, PSP_O_RDONLY, 0777);
@@ -273,7 +268,6 @@ void load_protocol_from_config(int protocol_idx) {
 
     // 3. Read the 4 lines for the current protocol
     char name_line[64], count_line[64], freq_line[64], bits_line[64];
-    
     if (read_line(fd, name_line, sizeof(name_line)) > 0 &&
         read_line(fd, count_line, sizeof(count_line)) > 0 &&
         read_line(fd, freq_line, sizeof(freq_line)) > 0 &&
@@ -282,7 +276,6 @@ void load_protocol_from_config(int protocol_idx) {
         // Parse keys: protocolName=, codeCount=, carrierFrequency=, bits=
         sscanf(name_line, "protocolName=%31s", protocols[protocol_idx].name);
         sscanf(count_line, "codeCount=%d", &protocols[protocol_idx].code_count);
-        
         int temp_freq, temp_bits;
         sscanf(freq_line, "carrierFrequency=%d", &temp_freq);
         sscanf(bits_line, "bits=%d", &temp_bits);
@@ -307,7 +300,7 @@ void scan_protocols(void) {
         SceIoDirent entry;
         protocol_count = 0;
         
-        while (sceIoDread(dir, &entry) > 0 && protocol_count < MAX_PROTOCOLS) {
+        while (sceIoDread(dir, &entry) > 0 && protocol_count < g_ir_config.MAX_PROTOCOLS) {
             if (!FIO_S_ISDIR(entry.d_stat.st_mode)) {
                 char *filename = entry.d_name;
                 
@@ -344,7 +337,7 @@ void scan_protocols(void) {
 }
 
 void load_protocol_codes(int protocol_idx) {
-    if (protocol_idx < 0 || protocol_idx >= MAX_PROTOCOLS) return;
+    if (protocol_idx < 0 || protocol_idx >= g_ir_config.MAX_PROTOCOLS) return;
     
     SceUID fd = sceIoOpen(protocols[protocol_idx].filename, PSP_O_RDONLY, 0);
     if (fd < 0) return;
@@ -620,13 +613,13 @@ void transmit_ir_code(unsigned int code) {
     state.current_code = code;
     
     // Add to history
-    if (history_count < HISTORY_SIZE) {
+    if (history_count < g_ir_config.HISTORY_SIZE) {
         history[history_index].code = code;
         history[history_index].protocol = state.ir_protocol;
         history[history_index].mode = IR_MODE_TX;
         history[history_index].timestamp = sceKernelGetSystemTimeLow();
-        history_index = (history_index + 1) % HISTORY_SIZE;
-        if (history_count < HISTORY_SIZE) history_count++;
+        history_index = (history_index + 1) % g_ir_config.HISTORY_SIZE;
+        if (history_count < g_ir_config.HISTORY_SIZE) history_count++;
     }
 }
 
@@ -659,7 +652,7 @@ void send_protocol_parameters(int protocol_idx) {
 void set_ir_protocol(int protocol_idx) {
     if (protocol_idx >= 0 && protocol_idx < protocol_count) {
         state.current_protocol_idx = protocol_idx;
-        save_default_protocol(protocol_idx);
+        load_protocol_from_config(protocol_idx);
         
         // Send protocol parameters to ESP32
         send_protocol_parameters(protocol_idx);
@@ -674,8 +667,6 @@ void set_ir_protocol(int protocol_idx) {
 // Characters: A-Z only Uppercase, 0-9, space
 // In the future, we could expand this to include more characters or symbols if needed and i feel the necessity, maibe by having it in the .ini file? .
 
-const char keyboard_layout[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
-
 void render_keyboard(void) {
     pspDebugScreenClear();
     debug_print(10, 10, "Enter Name for IR Code", 0xFFFFFF00);
@@ -686,7 +677,7 @@ void render_keyboard(void) {
     int row = 0;
     
     for (int i = 0; i < keyboard_size; i++) {
-        int col = i % KEYBOARD_COLS;
+        int col = i % g_ir_config.KEYBOARD_COLS;
         if (col == 0 && i > 0) row++;
         
         int x = 20 + col * 40;
@@ -711,7 +702,7 @@ void render_keyboard(void) {
 
 void handle_keyboard_input(SceCtrlData *pad) {
     int keyboard_size = strlen(keyboard_layout);
-    int max_rows = (keyboard_size + KEYBOARD_COLS - 1) / KEYBOARD_COLS;
+    int max_rows = (keyboard_size + g_ir_config.KEYBOARD_COLS - 1) / g_ir_config.KEYBOARD_COLS;
     
     if (pad->Buttons & PSP_CTRL_UP) {
         state.keyboard_cursor_y = (state.keyboard_cursor_y > 0) ? state.keyboard_cursor_y - 1 : max_rows - 1;
@@ -722,17 +713,17 @@ void handle_keyboard_input(SceCtrlData *pad) {
         sceKernelDelayThread(150000);
     }
     if (pad->Buttons & PSP_CTRL_LEFT) {
-        state.keyboard_cursor_x = (state.keyboard_cursor_x > 0) ? state.keyboard_cursor_x - 1 : KEYBOARD_COLS - 1;
+        state.keyboard_cursor_x = (state.keyboard_cursor_x > 0) ? state.keyboard_cursor_x - 1 : g_ir_config.KEYBOARD_COLS - 1;
         sceKernelDelayThread(150000);
     }
     if (pad->Buttons & PSP_CTRL_RIGHT) {
-        state.keyboard_cursor_x = (state.keyboard_cursor_x < KEYBOARD_COLS - 1) ? state.keyboard_cursor_x + 1 : 0;
+        state.keyboard_cursor_x = (state.keyboard_cursor_x < g_ir_config.KEYBOARD_COLS - 1) ? state.keyboard_cursor_x + 1 : 0;
         sceKernelDelayThread(150000);
     }
     
     if (pad->Buttons & PSP_CTRL_CROSS) {
         // Select character
-        int index = state.keyboard_cursor_y * KEYBOARD_COLS + state.keyboard_cursor_x;
+        int index = state.keyboard_cursor_y * g_ir_config.KEYBOARD_COLS + state.keyboard_cursor_x;
         if (index < keyboard_size) {
             int input_len = strlen(state.keyboard_input);
             if (input_len < sizeof(state.keyboard_input) - 1) {
@@ -788,9 +779,9 @@ void handle_input(SceCtrlData *pad) {
         // Main menu - load and transmit codes from current protocol
         int current_code_count = protocols[state.current_protocol_idx].code_count;
         // int codes_per_page = 10; moved to the define section
-        int total_pages = (current_code_count > 0) ? (current_code_count + codes_per_page - 1) / codes_per_page : 1;
-        int page_start = state.current_page * codes_per_page;
-        int page_end = (state.current_page + 1) * codes_per_page;
+        int total_pages = (current_code_count > 0) ? (current_code_count + g_ir_config.CODES_PER_PAGE - 1) / g_ir_config.CODES_PER_PAGE : 1;
+        int page_start = state.current_page * g_ir_config.CODES_PER_PAGE;
+        int page_end = (state.current_page + 1) * g_ir_config.CODES_PER_PAGE;
         if (page_end > current_code_count) page_end = current_code_count;
         
         if (pad->Buttons & PSP_CTRL_UP && state.selected_preset > 0) {
@@ -799,14 +790,14 @@ void handle_input(SceCtrlData *pad) {
         }else if (pad -> Buttons & PSP_CTRL_UP && state.selected_preset == 0 && state.current_page > 0)
         {
             state.current_page--;
-            state.selected_preset = codes_per_page -1;
+            state.selected_preset = g_ir_config.CODES_PER_PAGE -1;
             sceKernelDelayThread(150000);
         }else if (pad -> Buttons & PSP_CTRL_UP && state.selected_preset == 0 && state.current_page == 0)
         {
             state.current_page = total_pages -1;
-            int last_page_count = current_code_count % codes_per_page;
+            int last_page_count = current_code_count % g_ir_config.CODES_PER_PAGE;
             if (last_page_count == 0)
-                state.selected_preset = codes_per_page -1;
+                state.selected_preset = g_ir_config.CODES_PER_PAGE -1;
             else
                 state.selected_preset = last_page_count -1;
 
@@ -899,6 +890,12 @@ void handle_input(SceCtrlData *pad) {
             set_ir_protocol(state.selected_protocol);
             sceKernelDelayThread(300000);
         }
+
+        //maybe square to delete protocol? to be implemented
+
+        //maybe triangle to create a new protocolo?
+
+        //maybe circle to copy protocol?
     }
     
     if (state.menu_state == 3) {
@@ -907,6 +904,8 @@ void handle_input(SceCtrlData *pad) {
             // Scroll through history (can be enhanced) not implemented
             sceKernelDelayThread(150000);
         }
+
+        //maybe cross to resend the code? idk
 
         if (pad->Buttons & PSP_CTRL_START) {
             state.menu_state = 0; // Back to main menu
@@ -946,10 +945,10 @@ void render_main_menu(void) {
         
         // Display codes from current protocol with pagination
         int current_code_count = protocols[state.current_protocol_idx].code_count;
-        int codes_per_page = 10;
-        int total_pages = (current_code_count > 0) ? (current_code_count + codes_per_page - 1) / codes_per_page : 1;
-        int page_start = state.current_page * codes_per_page;
-        int page_end = (state.current_page + 1) * codes_per_page;
+        int g_ir_config.CODES_PER_PAGE = 10;
+        int total_pages = (current_code_count > 0) ? (current_code_count + g_ir_config.CODES_PER_PAGE - 1) / g_ir_config.CODES_PER_PAGE : 1;
+        int page_start = state.current_page * g_ir_config.CODES_PER_PAGE;
+        int page_end = (state.current_page + 1) * g_ir_config.CODES_PER_PAGE;
         if (page_end > current_code_count) page_end = current_code_count;
         
         if (current_code_count > 0) {
