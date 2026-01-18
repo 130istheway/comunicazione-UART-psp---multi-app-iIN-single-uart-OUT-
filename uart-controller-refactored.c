@@ -30,29 +30,56 @@ typedef struct {
     int buffer_limit;
 } Config;
 
-Config g_config = {9600, 750, 255}; // Valori di default
+Config g_config = {9600, 750, 255}; // Default values
 
-// --- FUNZIONE CARICAMENTO CONFIGURAZIONE ---
-void load_config() {
-    SceUID fd = sceIoOpen("ms0:/seplugins/uart_config.ini", PSP_O_RDONLY, 0777);
+void save_defaults() {
+    // Open for writing, create if it doesn't exist, and truncate if it does
+    SceUID fd = sceIoOpen(CONFIG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd >= 0) {
-        char file_buf[128];
-        int bytesRead = sceIoRead(fd, file_buf, sizeof(file_buf) - 1);
-        if (bytesRead > 0) {
-            file_buf[bytesRead] = '\0';
-            // Legge: Baudrate, Delay, BufferLimit
-            int b, d, l;
-            if (sscanf(file_buf, "%d %d %d", &b, &d, &l) == 3) {
-                g_config.baudrate = b;
-                g_config.delay_us = d;
-                // Protezione contro overflow: non superare MAX_BUFFER_SIZE - 1
-                if (l < MAX_BUFFER_SIZE) g_config.buffer_limit = l;
-                else g_config.buffer_limit = MAX_BUFFER_SIZE - 1;
-            }
-        }
+        char output[128];
+        // Format the defaults into a string
+        int len = sprintf(output, "baudrate = %d\ndelay_us = %d\nbuffer_limit = %d\n", 
+                          g_config.baudrate, g_config.delay_us, g_config.buffer_limit);
+        sceIoWrite(fd, output, len);
         sceIoClose(fd);
     }
 }
+
+void load_config() {
+    // Open the file using PSP SDK file I/O
+    SceUID fd = sceIoOpen("ms0:/seplugins/uart_config.ini", PSP_O_RDONLY, 0777);
+    if (fd < 0) return; // Exit if file doesn't exist
+
+    char file_buf[512];
+    int bytesRead = sceIoRead(fd, file_buf, sizeof(file_buf) - 1);
+    sceIoClose(fd);
+
+    if (bytesRead > 0) {
+        file_buf[bytesRead] = '\0';
+        
+        // Split the buffer into lines and parse each
+        char *line = strtok(file_buf, "\r\n");
+        while (line != NULL) {
+            int val;
+            // Use sscanf to match key = value pairs
+            // The " %d" format automatically skips the '=' and spaces
+            if (sscanf(line, "baudrate = %d", &val) == 1) {
+                g_config.baudrate = val;
+            } 
+            else if (sscanf(line, "delay_us = %d", &val) == 1) {
+                g_config.delay_us = val;
+            } 
+            else if (sscanf(line, "buffer_limit = %d", &val) == 1) {
+                // Apply protection against overflow
+                if (val < MAX_BUFFER_SIZE) g_config.buffer_limit = val;
+                else g_config.buffer_limit = MAX_BUFFER_SIZE - 1;
+            }
+            
+            line = strtok(NULL, "\r\n"); // Move to next line
+        }
+    } else save_defaults()
+}
+
 
 // --- RICEZIONE UART ---
 void process_uart_data(void) {
