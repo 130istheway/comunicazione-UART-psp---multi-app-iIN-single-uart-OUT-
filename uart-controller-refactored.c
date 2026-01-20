@@ -88,11 +88,23 @@ void process_uart_data(void) {
     if (ch != -1) {
         unsigned char c = (unsigned char)ch;
         
-        if (c == '\r') return; // Ignora Carriage Return (standard nei comandi AT)
+        if (c == '\0' OR c == '\r') return; // Ignora Carriage Return (standard nei comandi AT)
 
         if (c == '\n') {
             // Chiudi la stringa nel buffer
             uart_rx_buffer[uart_rx_index] = '\0';
+
+            // Se inizia con "IR+", lo passiamo così com'è (messaggio ESP32), in caso si aggiungessere diversi tipi, basta aggiungerli qui, il problema avviene solo se non ho stringa+comando
+            if (uart_rx_buffer[0] == 'I' && uart_rx_buffer[1] == 'R' && uart_rx_buffer[2] == '+') {
+                continue;
+            } 
+            // Altrimenti è una risposta del KCX (Bluetooth)
+            else{
+                char formatted_msg[g_config.buffer_limit];
+                // Aggiunge artificialmente AT+ per il plugin di controllo
+                snprintf(formatted_msg, g_config, "AT+%s", uart_rx_buffer);
+                uart_rx_buffer = formatted_msg;
+            }
             
             // Invia la risposta all'App/Plugin tramite la Pipe di ritorno
             // Usiamo PSP_MSGPIPE_NOWAIT per non bloccare il kernel se l'app non legge
@@ -118,6 +130,25 @@ void process_uart_data(void) {
         }
     }
 }
+
+
+
+void process_uart_line(char* line) {
+    if (line[0] == '\0') return;
+
+    // Se inizia con "IR+", lo passiamo così com'è (messaggio ESP32)
+    if (line[0] == 'I' && line[1] == 'R' && line[2] == '+') {
+        send_to_pipe(line);
+    } 
+    // Altrimenti è una risposta del KCX (Bluetooth)
+    else {
+        char formatted_msg[FORMAT_BUFFER_SIZE];
+        // Aggiunge artificialmente AT+ per il plugin di controllo
+        snprintf(formatted_msg, FORMAT_BUFFER_SIZE, "AT+%s", line);
+        send_to_pipe(formatted_msg);
+    }
+}
+
 
 
 // --- INVIO UART ---
