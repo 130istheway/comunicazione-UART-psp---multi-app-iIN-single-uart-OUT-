@@ -80,12 +80,24 @@ void load_config() {
     } else save_defaults()
 }
 
+/// @brief TRasmettere dati alla uart
+/// @param data 
+/// @param len 
+/// @return 
+int UARTManagerSend(void* data, int len) {
+    return sceKernelSendMsgPipe(cmd_pipe_out, data, len, PSP_MSGPIPE_WAIT, NULL, NULL);
+}
+
+int UARTManagerReceive(void* data, int max_len) {
+    return sceKernelReceiveMsgPipe(uart_resp_pipe, data, max_len, PSP_MSGPIPE_WAIT, NULL, NULL);
+}
+
 
 // --- RICEZIONE UART ---
 void process_uart_data(void) {
-    int ch = pspDebugSioGetchar();
+    int ch;
     
-    if (ch != -1) {
+    while ((ch = pspDebugSioGetchar()) != -1) {
         unsigned char c = (unsigned char)ch;
         
         if (c == '\r') return; // Ignora Carriage Return (standard nei comandi AT)
@@ -118,6 +130,84 @@ void process_uart_data(void) {
         }
     }
 }
+
+
+//Google respond of the control 
+/*
+La documentazione ufficiale Sony non è mai stata rilasciata al pubblico, ma la comunità homebrew (grazie al reverse engineering degli anni 2000) ha identificato esattamente come funziona il protocollo.
+Il telecomando comunica a 4800 bps (molto lento) quando è in modalità standard, ma dato che tu userai la UART a 38.400 bps per il Bluetooth, dovrai campionare i byte binari che arrivano.
+Ecco i dettagli tecnici per il tuo driver:
+1. Struttura del Pacchetto
+Il telecomando non invia un solo byte, ma un pacchetto di 5 byte ogni volta che un tasto viene premuto o rilasciato.
+Byte 0: Header (fisso, solitamente 0xFF o 0x00 a seconda del jitter).
+Byte 1: ID pacchetto.
+Byte 2: Codice del Tasto (Quello che ti serve).
+Byte 3: Checksum o bit di stato.
+Byte 4: Footer.
+2. Tabella dei Codici dei Tasti (Byte 2)
+In base ai sorgenti storici di progetti come RemoteJoy e PSPLINK, i valori esadecimali che leggerai sulla UART per i tasti fisici sono i seguenti:
+Tasto	Codice Esadecimale (Byte 2)	Azione Kernel PSP
+Play/Pause	0x01	PSP_CTRL_PLAYPAUSE
+Forward (Avanti)	0x02	PSP_CTRL_FORWARD
+Back (Indietro)	0x04	PSP_CTRL_BACK
+Volume +	0x08	PSP_CTRL_VOLUP
+Volume -	0x10	PSP_CTRL_VOLDOWN
+Hold	0x20	Blocca gli altri comandi
+*/
+
+
+//devo pensare se voglio gestire il telecomando della psp qui?
+/*
+void process_uart_data(void) {
+    int ch;
+    while ((ch = pspDebugSioGetchar()) != -1) {
+        unsigned char c = (unsigned char)ch;
+
+        // A. FILTRO TELECOMANDO ORIGINALE (Byte Binari < 32)
+        if (c < 32 && c != '\r' && c != '\n' && c != '\t') {
+            // Se il valore è molto basso, non è testo "AT+" o "IR+". 
+            // È quasi certamente un byte del telecomando Sony.
+            
+            // Esempio: Iniezione nel sistema tramite le maschere tasti PSP
+            if (c == 0x08) sceCtrlSetButtonMasks(PSP_CTRL_PLAYPAUSE, 0);
+            if (c == 0x01) sceCtrlSetButtonMasks(PSP_CTRL_VOLUP, 0);
+            // ... e così via per tutti i 6 tasti
+            continue; 
+        }
+
+        // B. FILTRO STRINGHE ( evrything that is not the control)
+        if (uart_rx_index < g_config.buffer_limit) {
+            uart_rx_buffer[uart_rx_index++] = c;
+
+
+            // GESTIONE COMANDI TESTUALI (in questo modo salto anche la verifica di hold+)
+                // 1. GESTIONE VOLUME
+                if      (strstr(uart_rx_buffer, "V+"))    inject_system_button(PSP_CTRL_VOLUP);
+                else if (strstr(uart_rx_buffer, "V-"))    inject_system_button(PSP_CTRL_VOLDOWN);
+                
+                // 2. GESTIONE RIPRODUZIONE
+                else if (strstr(uart_rx_buffer, "PLAY"))  inject_system_button(PSP_CTRL_PLAYPAUSE);
+                else if (strstr(uart_rx_buffer, "PAUSE")) inject_system_button(PSP_CTRL_PLAYPAUSE);
+                else if (strstr(uart_rx_buffer, "MUTE")) inject_system_button(PSP_CTRL_PLAYPAUSE);
+                
+                // 3. GESTIONE TRACCE
+                else if (strstr(uart_rx_buffer, "NEXT"))  inject_system_button(PSP_CTRL_FORWARD);
+                else if (strstr(uart_rx_buffer, "PREV"))  inject_system_button(PSP_CTRL_BACK);
+
+                // AUTO-PAUSE SU DISCONNESSIONE (Opzionale ma professionale non ne sono sicuro perchè mi sembra un problema nel caso la musica sia in pausa, in quel caso la avvia)
+                else if (strstr(uart_rx_buffer, "DISCON")) inject_system_button(PSP_CTRL_PLAYPAUSE);
+
+            
+            // Se troviamo un terminatore, spediamo la stringa intera alla pipe
+            if (c == '\n') {
+                uart_rx_buffer[uart_rx_index] = '\0';
+                sceKernelSendMsgPipe(uart_resp_pipe, uart_rx_buffer, uart_rx_index, PSP_MSGPIPE_NOWAIT, NULL, NULL);
+                uart_rx_index = 0;
+            }
+        }
+    }
+}
+*/
 
 
 // --- INVIO UART ---
@@ -160,6 +250,7 @@ int uart_manager_thread(SceSize args, void *argp) {
     }
     return 0;
 }
+
 
 // --- ENTRY POINTS DEL MODULO ---
 int module_start(SceSize args, void *argp) {
